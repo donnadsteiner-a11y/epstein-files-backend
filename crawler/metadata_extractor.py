@@ -16,7 +16,7 @@ from config.settings import (
     S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET,
     TRACKED_PERSONS, LOG_DIR
 )
-from db.database import init_db, get_db, update_document_text
+from db.database import init_db, get_db, update_document_text, query_rows, query_val
 
 os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
@@ -24,7 +24,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(os.path.join(LOG_DIR, "extractor.log")),
     ]
 )
 logger = logging.getLogger("metadata_extractor")
@@ -41,9 +40,8 @@ def get_s3_client():
 
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Extract text from a PDF using PyMuPDF (fitz)."""
     try:
-        import fitz  # PyMuPDF
+        import fitz
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         text_parts = []
         for page_num in range(len(doc)):
@@ -63,7 +61,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
                         text_parts.append(text)
             return "\n".join(text_parts)
         except ImportError:
-            logger.error("No PDF library available. Install PyMuPDF or pdfplumber.")
+            logger.error("No PDF library available.")
             return ""
     except Exception as e:
         logger.error(f"PDF extraction error: {e}")
@@ -71,75 +69,51 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 
 
 def find_persons_in_text(text: str) -> list[str]:
-    """Search document text for tracked persons of interest."""
     if not text:
         return []
-
     found = []
     text_lower = text.lower()
-
     for person in TRACKED_PERSONS:
-        # Simple case-insensitive name search
         if person.lower() in text_lower:
             found.append(person)
             continue
-
-        # Also check last name only (for partial mentions)
         parts = person.split()
         if len(parts) >= 2:
             last_name = parts[-1].lower()
-            # Only match last name if it's reasonably unique (>4 chars)
             if len(last_name) > 4 and last_name in text_lower:
-                # Verify it's likely a reference to this person
-                # by checking for nearby first name or context
                 first_name = parts[0].lower()
                 if first_name in text_lower:
                     if person not in found:
                         found.append(person)
-
     return found
 
 
 def extract_date_from_text(text: str) -> str | None:
-    """Try to extract a date from document text."""
     if not text:
         return None
-
-    # Common date patterns
     patterns = [
-        r'(\d{1,2}/\d{1,2}/\d{4})',           # MM/DD/YYYY
-        r'(\d{4}-\d{2}-\d{2})',                 # YYYY-MM-DD
-        r'(\w+ \d{1,2},? \d{4})',               # Month DD, YYYY
-        r'(\d{1,2} \w+ \d{4})',                 # DD Month YYYY
+        r'(\d{1,2}/\d{1,2}/\d{4})',
+        r'(\d{4}-\d{2}-\d{2})',
+        r'(\w+ \d{1,2},? \d{4})',
+        r'(\d{1,2} \w+ \d{4})',
     ]
-
     for pattern in patterns:
-        match = re.search(pattern, text[:5000])  # Only check first 5000 chars
+        match = re.search(pattern, text[:5000])
         if match:
             return match.group(1)
-
     return None
 
 
 def process_unindexed_documents(limit: int = 200):
-    """
-    Process all downloaded-but-not-yet-indexed documents:
-    1. Download PDF from S3
-    2. Extract text
-    3. Find person mentions
-    4. Update database
-    """
     s3 = get_s3_client()
 
     with get_db() as conn:
-        docs = conn.execute(
+        docs = query_rows(conn,
             "SELECT id, file_id, filename, file_type, s3_key FROM documents "
-            "WHERE status = 'downloaded' AND file_type = 'pdf' LIMIT ?",
-            (limit,)
-        ).fetchall()
+            "WHERE status = 'downloaded' AND file_type = 'pdf' LIMIT %s",
+            (limit,))
 
     logger.info(f"Found {len(docs)} unindexed PDFs to process")
-
     processed = 0
     errors = 0
 
@@ -147,41 +121,34 @@ def process_unindexed_documents(limit: int = 200):
         doc_id = doc["id"]
         s3_key = doc["s3_key"]
         filename = doc["filename"]
-
         logger.info(f"Processing [{doc_id}]: {filename}")
 
         try:
-            # Download from S3
             response = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
             pdf_bytes = response["Body"].read()
-
-            # Extract text
             text = extract_text_from_pdf(pdf_bytes)
             if not text:
                 logger.warning(f"  No text extracted from {filename}")
-                # Still mark as indexed so we don't retry
                 with get_db() as conn:
-                    conn.execute(
-                        "UPDATE documents SET status='indexed', extracted_text='[no text extracted]' WHERE id=?",
-                        (doc_id,)
-                    )
+                    cur = conn.cursor()
+                    cur.execute(
+                        "UPDATE documents SET status='indexed', extracted_text='[no text extracted]' WHERE id=%s",
+                        (doc_id,))
+                    cur.close()
                 continue
 
-            # Find persons
             persons_found = find_persons_in_text(text)
             logger.info(f"  Extracted {len(text)} chars, found {len(persons_found)} persons: {persons_found}")
 
-            # Try to find a date in the document
             doc_date = extract_date_from_text(text)
             if doc_date:
                 with get_db() as conn:
-                    conn.execute(
-                        "UPDATE documents SET date_on_doc=? WHERE id=? AND date_on_doc IS NULL",
-                        (doc_date, doc_id)
-                    )
+                    cur = conn.cursor()
+                    cur.execute(
+                        "UPDATE documents SET date_on_doc=%s WHERE id=%s AND date_on_doc IS NULL",
+                        (doc_date, doc_id))
+                    cur.close()
 
-            # Update database with text and person tags
-            # Truncate text to ~50K chars for storage efficiency
             update_document_text(doc_id, text[:50000], persons_found)
             processed += 1
 
@@ -194,45 +161,37 @@ def process_unindexed_documents(limit: int = 200):
 
 
 def process_images(limit: int = 200):
-    """
-    For image files (JPG, PNG, TIF), we can't extract text,
-    but we mark them as indexed and could add EXIF metadata.
-    """
     with get_db() as conn:
-        docs = conn.execute(
+        docs = query_rows(conn,
             "SELECT id, filename, file_type FROM documents "
-            "WHERE status = 'downloaded' AND file_type IN ('jpg','jpeg','png','tif','tiff') LIMIT ?",
-            (limit,)
-        ).fetchall()
+            "WHERE status = 'downloaded' AND file_type IN ('jpg','jpeg','png','tif','tiff') LIMIT %s",
+            (limit,))
 
     logger.info(f"Found {len(docs)} unindexed images to process")
-
     for doc in docs:
         with get_db() as conn:
-            conn.execute(
-                "UPDATE documents SET status='indexed', extracted_text='[image file]' WHERE id=?",
-                (doc["id"],)
-            )
-
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE documents SET status='indexed', extracted_text='[image file]' WHERE id=%s",
+                (doc["id"],))
+            cur.close()
     logger.info(f"Marked {len(docs)} images as indexed")
 
 
 def process_videos(limit: int = 200):
-    """Mark video files as indexed."""
     with get_db() as conn:
-        docs = conn.execute(
+        docs = query_rows(conn,
             "SELECT id FROM documents "
-            "WHERE status = 'downloaded' AND file_type IN ('mov','mp4') LIMIT ?",
-            (limit,)
-        ).fetchall()
+            "WHERE status = 'downloaded' AND file_type IN ('mov','mp4') LIMIT %s",
+            (limit,))
 
     for doc in docs:
         with get_db() as conn:
-            conn.execute(
-                "UPDATE documents SET status='indexed', extracted_text='[video file]' WHERE id=?",
-                (doc["id"],)
-            )
-
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE documents SET status='indexed', extracted_text='[video file]' WHERE id=%s",
+                (doc["id"],))
+            cur.close()
     logger.info(f"Marked {len(docs)} videos as indexed")
 
 
@@ -243,9 +202,7 @@ if __name__ == "__main__":
     process_videos()
 
     with get_db() as conn:
-        total_indexed = conn.execute(
-            "SELECT COUNT(*) as c FROM documents WHERE status='indexed'"
-        ).fetchone()["c"]
+        total_indexed = query_val(conn, "SELECT COUNT(*) FROM documents WHERE status='indexed'")
 
     print(f"\n{'='*50}")
     print(f"Extraction Summary")
