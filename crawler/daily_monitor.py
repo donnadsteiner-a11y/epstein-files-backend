@@ -10,7 +10,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import LOG_DIR
-from db.database import init_db, get_db, insert_monitor_log
+from db.database import init_db, get_db, insert_monitor_log, query_val
 from crawler.doj_scraper import scrape_all_datasets, scrape_main_disclosures_page
 from crawler.downloader import process_downloads
 from crawler.metadata_extractor import (
@@ -23,7 +23,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(os.path.join(LOG_DIR, "daily_monitor.log")),
     ]
 )
 logger = logging.getLogger("daily_monitor")
@@ -45,7 +44,7 @@ def run_daily_check():
 
     # Count files before
     with get_db() as conn:
-        count_before = conn.execute("SELECT COUNT(*) as c FROM scraped_urls").fetchone()["c"]
+        count_before = query_val(conn, "SELECT COUNT(*) FROM scraped_urls")
 
     # ── STEP 1: Scrape for new file links ──
     logger.info("STEP 1: Scraping DOJ for new file links...")
@@ -59,13 +58,16 @@ def run_daily_check():
 
     # Count new links
     with get_db() as conn:
-        count_after = conn.execute("SELECT COUNT(*) as c FROM scraped_urls").fetchone()["c"]
-        pending = conn.execute("SELECT COUNT(*) as c FROM scraped_urls WHERE downloaded=0").fetchone()["c"]
+        count_after = query_val(conn, "SELECT COUNT(*) FROM scraped_urls")
+        pending = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE downloaded=0")
 
     new_links = count_after - count_before
     logger.info(f"Found {new_links} new file links ({pending} pending download)")
 
     # ── STEP 2: Download new files ──
+    downloaded = 0
+    skipped = 0
+    errors = 0
     if pending > 0:
         logger.info("STEP 2: Downloading new files...")
         try:
@@ -77,11 +79,12 @@ def run_daily_check():
 
         logger.info(f"Downloaded: {downloaded}, Skipped: {skipped}, Errors: {errors}")
     else:
-        downloaded = 0
         logger.info("STEP 2: No new files to download")
 
     # ── STEP 3: Index new files ──
     logger.info("STEP 3: Extracting metadata from new files...")
+    processed = 0
+    extract_errors = 0
     try:
         processed, extract_errors = process_unindexed_documents(limit=200)
         process_images(limit=200)
@@ -110,9 +113,9 @@ def run_daily_check():
         details={
             "new_links": new_links,
             "downloaded": downloaded,
-            "skipped": skipped if pending > 0 else 0,
+            "skipped": skipped,
             "indexed": processed,
-            "errors": errors if pending > 0 else 0,
+            "errors": errors,
         }
     )
 
