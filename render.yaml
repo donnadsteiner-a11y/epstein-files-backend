@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: epstein-files-api
+    runtime: python
+    buildCommand: "pip install -r requirements.txt && python -m db.database"
+    startCommand: "gunicorn api.server:app --bind 0.0.0.0:$PORT"
+    plan: free
