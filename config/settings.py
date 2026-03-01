@@ -14,7 +14,7 @@ TEMP_DOWNLOAD_DIR = os.path.join(BASE_DIR, "temp_downloads")
 # ─── DREAMOBJECTS (S3-COMPATIBLE) ───────────────────────────────────────────
 # Get these from Dreamhost Panel → Cloud Services → DreamObjects
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "https://objects-us-east-1.dream.io")
-S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "005c4b661355d0b0000000002 S3")
+S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "005c4b661355d0b0000000002")
 S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "K005J0AcYbZ3DN5b7oZBsgPQ+DeJhu8")
 S3_BUCKET = os.environ.get("S3_BUCKET", "epstein-files")
 S3_PUBLIC_URL = f"{S3_ENDPOINT}/{S3_BUCKET}"
