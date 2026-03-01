@@ -17,7 +17,7 @@ from config.settings import (
 )
 from db.database import (
     init_db, get_documents, get_document_count, get_persons,
-    get_timeline, get_monitor_log, get_stats, get_db, query_one, query_rows
+    get_timeline, get_monitor_log, get_stats, get_db, query_one, query_rows, query_val
 )
 
 app = Flask(__name__, static_folder=STATIC_DIR)
@@ -184,6 +184,30 @@ def api_search():
         "persons": persons,
         "timeline_events": events,
     })
+
+@app.route("/api/pending")
+def api_pending():
+    """Check how many URLs are still pending download."""
+    with get_db() as conn:
+        total = query_val(conn, "SELECT COUNT(*) FROM scraped_urls")
+        pending = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE downloaded = 0")
+        downloaded = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE downloaded = 1")
+    return jsonify({"total_urls": total, "pending": pending, "downloaded": downloaded})
+
+@app.route("/api/reset-failed")
+def api_reset_failed():
+    """Reset all non-downloaded URLs so the downloader retries them."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        # Reset URLs that were scraped but never successfully downloaded to S3
+        cur.execute("""
+            UPDATE scraped_urls SET downloaded = 0
+            WHERE downloaded = 1
+            AND url NOT IN (SELECT source_url FROM documents WHERE source_url IS NOT NULL)
+        """)
+        reset_count = cur.rowcount
+        cur.close()
+    return jsonify({"reset": reset_count, "message": f"Reset {reset_count} URLs for retry"})
 
 @app.route("/api/health")
 def api_health():
