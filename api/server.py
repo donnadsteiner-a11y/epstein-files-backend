@@ -185,6 +185,22 @@ def api_search():
         "timeline_events": events,
     })
 
+@app.route("/api/scan-progress")
+def api_scan_progress():
+    """Show EFTA scanning progress per dataset."""
+    try:
+        from crawler.url_generator import get_scan_summary
+        summary = get_scan_summary()
+        total_found = sum(s["files_found"] for s in summary)
+        total_complete = sum(1 for s in summary if s["completed"])
+        return jsonify({
+            "datasets": summary,
+            "total_files_found": total_found,
+            "datasets_completed": total_complete,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/pending")
 def api_pending():
     """Check how many URLs are still pending download."""
