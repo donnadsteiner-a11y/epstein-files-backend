@@ -40,7 +40,7 @@ def run_daily_check():
     # ── STEP 1: Scan for new EFTA file URLs ──
     logger.info("STEP 1: Scanning for new EFTA file URLs...")
     try:
-        new_found, urls_checked, datasets_done = scan_all_datasets(batch_per_dataset=200)
+        new_found, urls_checked, datasets_done = scan_all_datasets(batch_per_dataset=2000)
         logger.info(f"Scan: {new_found} new files found, {urls_checked} URLs checked, {datasets_done}/12 datasets complete")
     except Exception as e:
         logger.error(f"URL scanning failed: {e}")
