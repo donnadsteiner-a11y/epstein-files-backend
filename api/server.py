@@ -17,7 +17,7 @@ from config.settings import (
 )
 from db.database import (
     init_db, get_documents, get_document_count, get_persons,
-    get_timeline, get_monitor_log, get_stats, get_db
+    get_timeline, get_monitor_log, get_stats, get_db, query_one, query_rows
 )
 
 app = Flask(__name__, static_folder=STATIC_DIR)
@@ -26,37 +26,24 @@ CORS(app, origins=CORS_ORIGINS)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
 
-
-# ─── STATIC FILE SERVING ────────────────────────────────────────────────────
+# Initialize database on startup
+init_db()
 
 @app.route("/")
 def serve_index():
-    """Serve the main HTML frontend."""
     return send_from_directory(STATIC_DIR, "index.html")
-
 
 @app.route("/static/<path:path>")
 def serve_static(path):
     return send_from_directory(STATIC_DIR, path)
 
-
-# ─── DASHBOARD STATS ────────────────────────────────────────────────────────
-
 @app.route("/api/stats")
 def api_stats():
-    """Dashboard overview statistics."""
     stats = get_stats()
     return jsonify(stats)
 
-
-# ─── DOCUMENTS ──────────────────────────────────────────────────────────────
-
 @app.route("/api/documents")
 def api_documents():
-    """
-    Paginated document listing with filters.
-    Query params: type, dataset, source, sort, q, limit, offset
-    """
     file_type = request.args.get("type", "all")
     dataset_id = request.args.get("dataset", type=int)
     source = request.args.get("source")
@@ -78,31 +65,21 @@ def api_documents():
         "offset": offset,
     })
 
-
 @app.route("/api/file/<file_id>")
 def api_file_redirect(file_id):
-    """Redirect to the actual file in DreamObjects storage."""
     with get_db() as conn:
-        doc = conn.execute(
-            "SELECT s3_url, source_url FROM documents WHERE file_id = ?", (file_id,)
-        ).fetchone()
+        doc = query_one(conn,
+            "SELECT s3_url, source_url FROM documents WHERE file_id = %s", (file_id,))
 
-    if doc and doc["s3_url"]:
+    if doc and doc.get("s3_url"):
         return redirect(doc["s3_url"])
-    elif doc and doc["source_url"]:
+    elif doc and doc.get("source_url"):
         return redirect(doc["source_url"])
     else:
         return jsonify({"error": "File not found"}), 404
 
-
-# ─── PERSONS ────────────────────────────────────────────────────────────────
-
 @app.route("/api/persons")
 def api_persons():
-    """
-    Persons of interest listing.
-    Query params: category, q, sort, limit
-    """
     category = request.args.get("category", "all")
     search = request.args.get("q")
     sort = request.args.get("sort", "mentions_desc")
@@ -111,39 +88,29 @@ def api_persons():
     persons = get_persons(category=category, search=search, sort=sort, limit=limit)
     return jsonify({"persons": persons, "total": len(persons)})
 
-
 @app.route("/api/persons/<name>/documents")
 def api_person_documents(name):
-    """Get documents associated with a specific person."""
     limit = min(request.args.get("limit", 50, type=int), 200)
 
     with get_db() as conn:
-        person = conn.execute(
-            "SELECT id FROM persons WHERE name = ?", (name,)
-        ).fetchone()
+        person = query_one(conn,
+            "SELECT id FROM persons WHERE name = %s", (name,))
 
         if not person:
             return jsonify({"error": "Person not found"}), 404
 
-        docs = conn.execute("""
+        docs = query_rows(conn, """
             SELECT d.* FROM documents d
             JOIN document_persons dp ON d.id = dp.document_id
-            WHERE dp.person_id = ?
+            WHERE dp.person_id = %s
             ORDER BY d.date_on_doc DESC
-            LIMIT ?
-        """, (person["id"], limit)).fetchall()
+            LIMIT %s
+        """, (person["id"], limit))
 
-    return jsonify({"documents": [dict(d) for d in docs], "person": name})
-
-
-# ─── TIMELINE ───────────────────────────────────────────────────────────────
+    return jsonify({"documents": docs, "person": name})
 
 @app.route("/api/timeline")
 def api_timeline():
-    """
-    Timeline events with filters.
-    Query params: person, type, year_start, year_end, q, limit
-    """
     person = request.args.get("person", "all")
     event_type = request.args.get("type", "all")
     year_start = request.args.get("year_start", type=int)
@@ -158,12 +125,8 @@ def api_timeline():
     )
     return jsonify({"events": events, "total": len(events)})
 
-
-# ─── FLIGHTS ────────────────────────────────────────────────────────────────
-
 @app.route("/api/flights")
 def api_flights():
-    """Known flight routes (static data)."""
     flights = [
         {"from": "Teterboro, NJ", "to": "Palm Beach, FL", "freq": "Regular", "aircraft": "Boeing 727 / Gulfstream", "alias": "Lolita Express"},
         {"from": "Palm Beach, FL", "to": "Little St. James, USVI", "freq": "Regular", "aircraft": "Boeing 727 / Gulfstream", "alias": "Lolita Express"},
@@ -174,12 +137,8 @@ def api_flights():
     ]
     return jsonify({"flights": flights})
 
-
-# ─── LOCATIONS ──────────────────────────────────────────────────────────────
-
 @app.route("/api/locations")
 def api_locations():
-    """Known locations (static data)."""
     locations = [
         {"name": "Manhattan Townhouse", "address": "9 E 71st St, New York, NY", "lat": 40.7712, "lng": -73.9645, "type": "property"},
         {"name": "Palm Beach Estate", "address": "358 El Brillo Way, Palm Beach, FL", "lat": 26.7054, "lng": -80.0384, "type": "property"},
@@ -192,12 +151,8 @@ def api_locations():
     ]
     return jsonify({"locations": locations})
 
-
-# ─── DATASETS ───────────────────────────────────────────────────────────────
-
 @app.route("/api/datasets")
 def api_datasets():
-    """DOJ data set inventory with document counts from our DB."""
     datasets = []
     for ds_id in range(1, 13):
         count = get_document_count(dataset_id=ds_id)
@@ -209,30 +164,20 @@ def api_datasets():
         })
     return jsonify({"datasets": datasets})
 
-
-# ─── MONITOR ────────────────────────────────────────────────────────────────
-
 @app.route("/api/monitor")
 def api_monitor():
-    """Monitor status and recent activity log."""
     limit = min(request.args.get("limit", 50, type=int), 200)
     log = get_monitor_log(limit=limit)
     return jsonify({"log": log, "total": len(log)})
 
-
-# ─── SEARCH (cross-entity) ─────────────────────────────────────────────────
-
 @app.route("/api/search")
 def api_search():
-    """Search across documents, persons, and timeline events."""
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"error": "Search query required"}), 400
-
     docs = get_documents(search=q, limit=20)
     persons = get_persons(search=q, limit=10)
     events = get_timeline(search=q, limit=20)
-
     return jsonify({
         "query": q,
         "documents": docs,
@@ -240,26 +185,10 @@ def api_search():
         "timeline_events": events,
     })
 
-
-# ─── HEALTH CHECK ───────────────────────────────────────────────────────────
-
 @app.route("/api/health")
 def api_health():
-    """Health check endpoint."""
     return jsonify({"status": "ok", "version": "2.1.0"})
 
-
-# ─── PASSENGER WSGI COMPATIBILITY ───────────────────────────────────────────
-
-# For Dreamhost Passenger deployment, create a passenger_wsgi.py file
-# in your domain's web root with:
-#
-#   import sys
-#   sys.path.insert(0, '/home/your-user/epstein-files-platform')
-#   from api.server import app as application
-#
-
 if __name__ == "__main__":
-    init_db()
     logger.info(f"Starting API server on {API_HOST}:{API_PORT}")
     app.run(host=API_HOST, port=API_PORT, debug=API_DEBUG)
