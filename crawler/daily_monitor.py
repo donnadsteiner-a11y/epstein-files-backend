@@ -1,7 +1,9 @@
 """
 Daily Monitor — Designed to run as a cron job.
-Checks the DOJ EFTA disclosures page for new files,
-downloads any new additions, and logs activity.
+1. Scans for new EFTA file URLs by sequential number checking
+2. Downloads any new files to DreamObjects
+3. Extracts text and tags persons
+4. Logs activity
 """
 import os
 import sys
@@ -11,7 +13,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import LOG_DIR
 from db.database import init_db, get_db, insert_monitor_log, query_val
-from crawler.doj_scraper import scrape_all_datasets, scrape_main_disclosures_page
+from crawler.url_generator import scan_all_datasets, get_scan_summary
 from crawler.downloader import process_downloads
 from crawler.metadata_extractor import (
     process_unindexed_documents, process_images, process_videos
@@ -29,40 +31,27 @@ logger = logging.getLogger("daily_monitor")
 
 
 def run_daily_check():
-    """
-    Full daily monitoring pipeline:
-    1. Scrape DOJ for new file links
-    2. Download any new files
-    3. Extract text & tag persons
-    4. Log results
-    """
     logger.info("=" * 60)
     logger.info(f"DAILY DOJ MONITOR — {datetime.now().isoformat()}")
     logger.info("=" * 60)
 
     init_db()
 
-    # Count files before
-    with get_db() as conn:
-        count_before = query_val(conn, "SELECT COUNT(*) FROM scraped_urls")
-
-    # ── STEP 1: Scrape for new file links ──
-    logger.info("STEP 1: Scraping DOJ for new file links...")
+    # ── STEP 1: Scan for new EFTA file URLs ──
+    logger.info("STEP 1: Scanning for new EFTA file URLs...")
     try:
-        scrape_main_disclosures_page()
-        scrape_all_datasets()
+        new_found, urls_checked, datasets_done = scan_all_datasets(batch_per_dataset=200)
+        logger.info(f"Scan: {new_found} new files found, {urls_checked} URLs checked, {datasets_done}/12 datasets complete")
     except Exception as e:
-        logger.error(f"Scraping failed: {e}")
-        insert_monitor_log("doj_efta", "error", f"Scrape failed: {e}")
+        logger.error(f"URL scanning failed: {e}")
+        insert_monitor_log("doj_efta", "error", f"Scan failed: {e}")
         return
 
-    # Count new links
+    # Check pending downloads
     with get_db() as conn:
-        count_after = query_val(conn, "SELECT COUNT(*) FROM scraped_urls")
         pending = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE downloaded=0")
 
-    new_links = count_after - count_before
-    logger.info(f"Found {new_links} new file links ({pending} pending download)")
+    logger.info(f"Pending downloads: {pending}")
 
     # ── STEP 2: Download new files ──
     downloaded = 0
@@ -76,7 +65,6 @@ def run_daily_check():
             logger.error(f"Download failed: {e}")
             insert_monitor_log("doj_efta", "error", f"Download failed: {e}")
             return
-
         logger.info(f"Downloaded: {downloaded}, Skipped: {skipped}, Errors: {errors}")
     else:
         logger.info("STEP 2: No new files to download")
@@ -95,15 +83,18 @@ def run_daily_check():
         return
 
     # ── STEP 4: Log results ──
-    if downloaded > 0 or new_links > 10:
+    if downloaded > 0 or new_found > 10:
         status = "major" if downloaded > 50 else "update"
         result = f"{downloaded} new files downloaded, {processed} indexed"
-    elif new_links > 0:
+    elif new_found > 0:
         status = "update"
-        result = f"{new_links} new links found, {downloaded} downloaded"
+        result = f"{new_found} new URLs found, {downloaded} downloaded"
     else:
         status = "checked"
-        result = "No new files"
+        result = f"Scan: {urls_checked} checked, {new_found} new. {datasets_done}/12 datasets scanned."
+
+    scan_summary = get_scan_summary()
+    total_files_found = sum(s["files_found"] for s in scan_summary)
 
     insert_monitor_log(
         source="doj_efta",
@@ -111,7 +102,10 @@ def run_daily_check():
         result=result,
         new_files=downloaded,
         details={
-            "new_links": new_links,
+            "new_urls_found": new_found,
+            "urls_checked": urls_checked,
+            "datasets_complete": datasets_done,
+            "total_files_discovered": total_files_found,
             "downloaded": downloaded,
             "skipped": skipped,
             "indexed": processed,
@@ -120,6 +114,7 @@ def run_daily_check():
     )
 
     logger.info(f"\nDaily monitor complete: {result}")
+    logger.info(f"Total EFTA files discovered so far: {total_files_found}")
     logger.info("=" * 60)
 
 
