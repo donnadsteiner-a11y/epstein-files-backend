@@ -1,6 +1,7 @@
 """
 PostgreSQL database layer for the Epstein Files Platform.
 Uses Render's free PostgreSQL for persistent storage that survives restarts.
+Uses psycopg 3 driver (compatible with Python 3.14).
 """
 import os
 import sys
@@ -9,8 +10,8 @@ import logging
 from datetime import datetime
 from contextlib import contextmanager
 
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import DATABASE_URL
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 @contextmanager
 def get_db():
     """Context manager for database connections."""
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg.connect(DATABASE_URL)
     conn.autocommit = False
     try:
         yield conn
@@ -33,21 +34,31 @@ def get_db():
         conn.close()
 
 
-def dict_rows(cursor):
-    """Convert cursor results to list of dicts."""
-    if cursor.description is None:
-        return []
-    cols = [d[0] for d in cursor.description]
-    return [dict(zip(cols, row)) for row in cursor.fetchall()]
+def query_rows(conn, sql, params=None):
+    """Execute query and return list of dicts."""
+    cur = conn.cursor(row_factory=dict_row)
+    cur.execute(sql, params or ())
+    rows = cur.fetchall()
+    cur.close()
+    return rows
 
 
-def dict_row(cursor):
-    """Convert single cursor result to dict."""
-    if cursor.description is None:
-        return None
-    cols = [d[0] for d in cursor.description]
-    row = cursor.fetchone()
-    return dict(zip(cols, row)) if row else None
+def query_one(conn, sql, params=None):
+    """Execute query and return single dict."""
+    cur = conn.cursor(row_factory=dict_row)
+    cur.execute(sql, params or ())
+    row = cur.fetchone()
+    cur.close()
+    return row
+
+
+def query_val(conn, sql, params=None):
+    """Execute query and return single value."""
+    cur = conn.cursor()
+    cur.execute(sql, params or ())
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else None
 
 
 def init_db():
@@ -55,7 +66,6 @@ def init_db():
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
-        -- ═══ DOCUMENTS ═══
         CREATE TABLE IF NOT EXISTS documents (
             id              SERIAL PRIMARY KEY,
             file_id         TEXT UNIQUE NOT NULL,
@@ -78,7 +88,6 @@ def init_db():
             created_at      TIMESTAMP DEFAULT NOW(),
             updated_at      TIMESTAMP DEFAULT NOW()
         );
-
         CREATE INDEX IF NOT EXISTS idx_documents_file_type ON documents(file_type);
         CREATE INDEX IF NOT EXISTS idx_documents_dataset ON documents(dataset_id);
         CREATE INDEX IF NOT EXISTS idx_documents_date ON documents(date_on_doc);
@@ -86,7 +95,6 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(sha256_hash);
         CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
 
-        -- ═══ PERSONS ═══
         CREATE TABLE IF NOT EXISTS persons (
             id          SERIAL PRIMARY KEY,
             name        TEXT UNIQUE NOT NULL,
@@ -98,11 +106,9 @@ def init_db():
             created_at  TIMESTAMP DEFAULT NOW(),
             updated_at  TIMESTAMP DEFAULT NOW()
         );
-
         CREATE INDEX IF NOT EXISTS idx_persons_category ON persons(category);
         CREATE INDEX IF NOT EXISTS idx_persons_mentions ON persons(mentions DESC);
 
-        -- ═══ DOCUMENT <-> PERSON TAGS ═══
         CREATE TABLE IF NOT EXISTS document_persons (
             id          SERIAL PRIMARY KEY,
             document_id INTEGER NOT NULL REFERENCES documents(id),
@@ -111,11 +117,9 @@ def init_db():
             context     TEXT,
             UNIQUE(document_id, person_id)
         );
-
         CREATE INDEX IF NOT EXISTS idx_docpersons_doc ON document_persons(document_id);
         CREATE INDEX IF NOT EXISTS idx_docpersons_person ON document_persons(person_id);
 
-        -- ═══ TIMELINE EVENTS ═══
         CREATE TABLE IF NOT EXISTS timeline_events (
             id          SERIAL PRIMARY KEY,
             date        TEXT NOT NULL,
@@ -128,11 +132,9 @@ def init_db():
             source      TEXT,
             created_at  TIMESTAMP DEFAULT NOW()
         );
-
         CREATE INDEX IF NOT EXISTS idx_timeline_date ON timeline_events(date);
         CREATE INDEX IF NOT EXISTS idx_timeline_type ON timeline_events(type);
 
-        -- ═══ MONITOR LOG ═══
         CREATE TABLE IF NOT EXISTS monitor_log (
             id          SERIAL PRIMARY KEY,
             timestamp   TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -142,10 +144,8 @@ def init_db():
             new_files   INTEGER DEFAULT 0,
             details_json TEXT
         );
-
         CREATE INDEX IF NOT EXISTS idx_monitor_timestamp ON monitor_log(timestamp DESC);
 
-        -- ═══ SCRAPED URLS ═══
         CREATE TABLE IF NOT EXISTS scraped_urls (
             id          SERIAL PRIMARY KEY,
             url         TEXT UNIQUE NOT NULL,
@@ -155,11 +155,9 @@ def init_db():
             file_type   TEXT,
             downloaded  INTEGER DEFAULT 0
         );
-
         CREATE INDEX IF NOT EXISTS idx_scraped_downloaded ON scraped_urls(downloaded);
         """)
         cur.close()
-
     logger.info("PostgreSQL database initialized")
 
 
@@ -168,7 +166,6 @@ def init_db():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def insert_document(doc_data: dict) -> int:
-    """Insert a new document record. Returns the new row id."""
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -203,10 +200,8 @@ def insert_document(doc_data: dict) -> int:
 
 def get_documents(file_type=None, dataset_id=None, source=None,
                   sort="date_desc", search=None, limit=100, offset=0):
-    """Query documents with filters."""
     query = "SELECT * FROM documents WHERE 1=1"
     params = []
-
     if file_type and file_type != "all":
         query += " AND file_type = %s"
         params.append(file_type)
@@ -220,7 +215,6 @@ def get_documents(file_type=None, dataset_id=None, source=None,
         query += " AND (title ILIKE %s OR filename ILIKE %s OR extracted_text ILIKE %s)"
         s = f"%{search}%"
         params.extend([s, s, s])
-
     sort_map = {
         "date_desc": "date_on_doc DESC NULLS LAST",
         "date_asc": "date_on_doc ASC NULLS LAST",
@@ -231,18 +225,12 @@ def get_documents(file_type=None, dataset_id=None, source=None,
     query += f" ORDER BY {sort_map.get(sort, 'date_downloaded DESC')}"
     query += " LIMIT %s OFFSET %s"
     params.extend([limit, offset])
-
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute(query, params)
-        rows = dict_rows(cur)
-        cur.close()
-        return rows
+        return query_rows(conn, query, params)
 
 
 def get_document_count(file_type=None, dataset_id=None):
-    """Get total document count with optional filters."""
-    query = "SELECT COUNT(*) as cnt FROM documents WHERE 1=1"
+    query = "SELECT COUNT(*) FROM documents WHERE 1=1"
     params = []
     if file_type and file_type != "all":
         query += " AND file_type = %s"
@@ -250,35 +238,24 @@ def get_document_count(file_type=None, dataset_id=None):
     if dataset_id:
         query += " AND dataset_id = %s"
         params.append(dataset_id)
-
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute(query, params)
-        row = cur.fetchone()
-        cur.close()
-        return row[0] if row else 0
+        return query_val(conn, query, params)
 
 
 def document_exists(sha256_hash=None, source_url=None):
-    """Check if a document already exists (by hash or URL)."""
     with get_db() as conn:
-        cur = conn.cursor()
         if sha256_hash:
-            cur.execute("SELECT id FROM documents WHERE sha256_hash = %s", (sha256_hash,))
-            if cur.fetchone():
-                cur.close()
+            r = query_val(conn, "SELECT id FROM documents WHERE sha256_hash = %s", (sha256_hash,))
+            if r:
                 return True
         if source_url:
-            cur.execute("SELECT id FROM documents WHERE source_url = %s", (source_url,))
-            if cur.fetchone():
-                cur.close()
+            r = query_val(conn, "SELECT id FROM documents WHERE source_url = %s", (source_url,))
+            if r:
                 return True
-        cur.close()
     return False
 
 
 def update_document_text(doc_id: int, extracted_text: str, persons_found: list):
-    """Update a document with extracted text and person tags."""
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -286,16 +263,15 @@ def update_document_text(doc_id: int, extracted_text: str, persons_found: list):
             (extracted_text, doc_id)
         )
         for person_name in persons_found:
-            cur.execute("SELECT id FROM persons WHERE name = %s", (person_name,))
-            person = cur.fetchone()
-            if person:
+            row = query_val(conn, "SELECT id FROM persons WHERE name = %s", (person_name,))
+            if row:
                 cur.execute(
                     "INSERT INTO document_persons (document_id, person_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                    (doc_id, person[0])
+                    (doc_id, row)
                 )
                 cur.execute(
                     "UPDATE persons SET mentions = mentions + 1, updated_at = NOW() WHERE id = %s",
-                    (person[0],)
+                    (row,)
                 )
         cur.close()
 
@@ -305,7 +281,6 @@ def update_document_text(doc_id: int, extracted_text: str, persons_found: list):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def insert_person(name, role=None, status=None, category=None, mentions=0):
-    """Insert or update a person."""
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -321,10 +296,8 @@ def insert_person(name, role=None, status=None, category=None, mentions=0):
 
 
 def get_persons(category=None, search=None, sort="mentions_desc", limit=100):
-    """Get persons with optional filters."""
     query = "SELECT * FROM persons WHERE 1=1"
     params = []
-
     if category and category != "all":
         query += " AND category = %s"
         params.append(category)
@@ -332,17 +305,11 @@ def get_persons(category=None, search=None, sort="mentions_desc", limit=100):
         query += " AND (name ILIKE %s OR role ILIKE %s)"
         s = f"%{search}%"
         params.extend([s, s])
-
     sort_map = {"mentions_desc": "mentions DESC", "name": "name ASC"}
     query += f" ORDER BY {sort_map.get(sort, 'mentions DESC')} LIMIT %s"
     params.append(limit)
-
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute(query, params)
-        rows = dict_rows(cur)
-        cur.close()
-        return rows
+        return query_rows(conn, query, params)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -351,10 +318,8 @@ def get_persons(category=None, search=None, sort="mentions_desc", limit=100):
 
 def get_timeline(person=None, event_type=None, year_start=None, year_end=None,
                  search=None, limit=200):
-    """Get timeline events with filters."""
     query = "SELECT * FROM timeline_events WHERE 1=1"
     params = []
-
     if event_type and event_type != "all":
         query += " AND type = %s"
         params.append(event_type)
@@ -371,20 +336,13 @@ def get_timeline(person=None, event_type=None, year_start=None, year_end=None,
         query += " AND (title ILIKE %s OR description ILIKE %s)"
         s = f"%{search}%"
         params.extend([s, s])
-
     query += " ORDER BY date ASC LIMIT %s"
     params.append(limit)
-
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute(query, params)
-        rows = dict_rows(cur)
-        cur.close()
-        result = []
+        rows = query_rows(conn, query, params)
         for r in rows:
             r["persons"] = json.loads(r.get("persons_json", "[]") or "[]")
-            result.append(r)
-        return result
+        return rows
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -392,7 +350,6 @@ def get_timeline(person=None, event_type=None, year_start=None, year_end=None,
 # ═══════════════════════════════════════════════════════════════════════════
 
 def insert_monitor_log(source, status, result, new_files=0, details=None):
-    """Log a monitoring check."""
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -403,13 +360,8 @@ def insert_monitor_log(source, status, result, new_files=0, details=None):
 
 
 def get_monitor_log(limit=50):
-    """Get recent monitor activity."""
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM monitor_log ORDER BY timestamp DESC LIMIT %s", (limit,))
-        rows = dict_rows(cur)
-        cur.close()
-        # Convert timestamp to string for JSON serialization
+        rows = query_rows(conn, "SELECT * FROM monitor_log ORDER BY timestamp DESC LIMIT %s", (limit,))
         for r in rows:
             if r.get("timestamp"):
                 r["timestamp"] = r["timestamp"].isoformat() if hasattr(r["timestamp"], "isoformat") else str(r["timestamp"])
@@ -421,17 +373,12 @@ def get_monitor_log(limit=50):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def url_already_scraped(url):
-    """Check if we've already scraped this URL."""
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT downloaded FROM scraped_urls WHERE url = %s", (url,))
-        row = cur.fetchone()
-        cur.close()
-        return row and row[0] == 1
+        r = query_val(conn, "SELECT downloaded FROM scraped_urls WHERE url = %s", (url,))
+        return r == 1
 
 
 def mark_url_scraped(url, dataset_id=None, file_type=None, downloaded=True):
-    """Record that we've seen/downloaded a URL."""
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -445,16 +392,10 @@ def mark_url_scraped(url, dataset_id=None, file_type=None, downloaded=True):
 
 
 def get_undownloaded_urls(limit=500):
-    """Get URLs we've seen but not yet downloaded."""
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute(
+        return query_rows(conn,
             "SELECT * FROM scraped_urls WHERE downloaded = 0 ORDER BY first_seen ASC LIMIT %s",
-            (limit,)
-        )
-        rows = dict_rows(cur)
-        cur.close()
-        return rows
+            (limit,))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -462,31 +403,16 @@ def get_undownloaded_urls(limit=500):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_stats():
-    """Get dashboard statistics."""
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM documents")
-        total_docs = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM documents WHERE file_type='pdf'")
-        total_pdfs = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM documents WHERE file_type IN ('jpg','jpeg','png','tif','tiff')")
-        total_images = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM documents WHERE file_type IN ('mov','mp4')")
-        total_videos = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM persons")
-        total_persons = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM documents WHERE status='indexed'")
-        total_indexed = cur.fetchone()[0]
-        cur.execute("SELECT COALESCE(SUM(file_size),0) FROM documents")
-        total_size = cur.fetchone()[0]
-
-        cur.execute("SELECT * FROM monitor_log ORDER BY timestamp DESC LIMIT 1")
-        last_log = dict_row(cur)
-
-        cur.execute("SELECT COALESCE(SUM(new_files),0) FROM monitor_log WHERE timestamp > NOW() - INTERVAL '7 days'")
-        recent_new = cur.fetchone()[0]
-
-        cur.close()
+        total_docs = query_val(conn, "SELECT COUNT(*) FROM documents")
+        total_pdfs = query_val(conn, "SELECT COUNT(*) FROM documents WHERE file_type='pdf'")
+        total_images = query_val(conn, "SELECT COUNT(*) FROM documents WHERE file_type IN ('jpg','jpeg','png','tif','tiff')")
+        total_videos = query_val(conn, "SELECT COUNT(*) FROM documents WHERE file_type IN ('mov','mp4')")
+        total_persons = query_val(conn, "SELECT COUNT(*) FROM persons")
+        total_indexed = query_val(conn, "SELECT COUNT(*) FROM documents WHERE status='indexed'")
+        total_size = query_val(conn, "SELECT COALESCE(SUM(file_size),0) FROM documents")
+        last_log = query_one(conn, "SELECT * FROM monitor_log ORDER BY timestamp DESC LIMIT 1")
+        recent_new = query_val(conn, "SELECT COALESCE(SUM(new_files),0) FROM monitor_log WHERE timestamp > NOW() - INTERVAL '7 days'")
 
     if last_log and last_log.get("timestamp"):
         last_log["timestamp"] = last_log["timestamp"].isoformat() if hasattr(last_log["timestamp"], "isoformat") else str(last_log["timestamp"])
@@ -506,7 +432,6 @@ def get_stats():
 
 
 def _human_size(size_bytes):
-    """Convert bytes to human-readable string."""
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if size_bytes < 1024:
             return f"{size_bytes:.1f} {unit}"
@@ -519,15 +444,11 @@ def _human_size(size_bytes):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def seed_persons():
-    """Populate the persons table with known individuals (only if empty)."""
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM persons")
-        if cur.fetchone()[0] > 0:
+        count = query_val(conn, "SELECT COUNT(*) FROM persons")
+        if count > 0:
             logger.info("Persons table already seeded, skipping")
-            cur.close()
             return
-        cur.close()
 
     persons_data = [
         ("Jeffrey Epstein", "Principal Subject", "Deceased", "principal", 6000000),
@@ -566,15 +487,11 @@ def seed_persons():
 
 
 def seed_timeline():
-    """Populate timeline with known events (only if empty)."""
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM timeline_events")
-        if cur.fetchone()[0] > 0:
+        count = query_val(conn, "SELECT COUNT(*) FROM timeline_events")
+        if count > 0:
             logger.info("Timeline already seeded, skipping")
-            cur.close()
             return
-        cur.close()
 
     events = [
         ("1996-09-01","fbi","Maria Farmer FBI Complaint","First known FBI complaint about Epstein's crimes. FBI fails to investigate.","New York, NY",["Maria Farmer","Jeffrey Epstein"]),
@@ -610,4 +527,3 @@ if __name__ == "__main__":
     seed_persons()
     seed_timeline()
     print("PostgreSQL database initialized and seeded!")
-
