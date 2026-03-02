@@ -141,12 +141,7 @@ def process_downloads(limit: int = 500):
             continue
 
         if document_exists(sha256_hash=sha256):
-            logger.info(f"  Duplicate (SHA256 match), skipping: {filename}")
-            mark_url_scraped(url, downloaded=True)
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            skipped += 1
-            continue
+            logger.debug(f"  SHA256 match but keeping unique EFTA file: {filename}")
 
         ds_prefix = f"dataset_{dataset_id:02d}" if dataset_id else "other"
         s3_key = f"{ds_prefix}/{file_type}/{filename}"
