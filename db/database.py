@@ -1,7 +1,7 @@
 """
 PostgreSQL database layer for the Epstein Files Platform.
-Uses Render's free PostgreSQL for persistent storage that survives restarts.
-Uses psycopg 3 driver (compatible with Python 3.14).
+Uses Render PostgreSQL for persistent storage that survives restarts.
+Uses psycopg 3 driver.
 """
 import os
 import sys
@@ -88,6 +88,8 @@ def init_db():
             created_at      TIMESTAMP DEFAULT NOW(),
             updated_at      TIMESTAMP DEFAULT NOW()
         );
+
+        -- Basic indexes
         CREATE INDEX IF NOT EXISTS idx_documents_file_type ON documents(file_type);
         CREATE INDEX IF NOT EXISTS idx_documents_dataset ON documents(dataset_id);
         CREATE INDEX IF NOT EXISTS idx_documents_date ON documents(date_on_doc);
@@ -95,19 +97,26 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(sha256_hash);
         CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
 
+        -- Composite indexes for scale (common filters + sorts)
+        CREATE INDEX IF NOT EXISTS idx_documents_dataset_type_date
+            ON documents(dataset_id, file_type, date_on_doc DESC NULLS LAST);
+        CREATE INDEX IF NOT EXISTS idx_documents_source_date
+            ON documents(source, date_on_doc DESC NULLS LAST);
+
         CREATE TABLE IF NOT EXISTS persons (
-            id          SERIAL PRIMARY KEY,
-            name        TEXT UNIQUE NOT NULL,
-            role        TEXT,
-            status      TEXT,
-            category    TEXT,
-            mentions    INTEGER DEFAULT 0,
+            id            SERIAL PRIMARY KEY,
+            name          TEXT UNIQUE NOT NULL,
+            role          TEXT,
+            status        TEXT,
+            category      TEXT,
+            mentions      INTEGER DEFAULT 0,
             metadata_json TEXT,
-            created_at  TIMESTAMP DEFAULT NOW(),
-            updated_at  TIMESTAMP DEFAULT NOW()
+            created_at    TIMESTAMP DEFAULT NOW(),
+            updated_at    TIMESTAMP DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_persons_category ON persons(category);
         CREATE INDEX IF NOT EXISTS idx_persons_mentions ON persons(mentions DESC);
+        CREATE INDEX IF NOT EXISTS idx_persons_name ON persons(name);
 
         CREATE TABLE IF NOT EXISTS document_persons (
             id          SERIAL PRIMARY KEY,
@@ -121,41 +130,42 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_docpersons_person ON document_persons(person_id);
 
         CREATE TABLE IF NOT EXISTS timeline_events (
-            id          SERIAL PRIMARY KEY,
-            date        DATE NOT NULL,
-            type        TEXT NOT NULL,
-            title       TEXT NOT NULL,
-            description TEXT,
-            location    TEXT,
-            persons_json TEXT,
+            id            SERIAL PRIMARY KEY,
+            date          DATE NOT NULL,
+            type          TEXT NOT NULL,
+            title         TEXT NOT NULL,
+            description   TEXT,
+            location      TEXT,
+            persons_json  TEXT,
             source_doc_id INTEGER REFERENCES documents(id),
-            source      TEXT,
-            created_at  TIMESTAMP DEFAULT NOW()
+            source        TEXT,
+            created_at    TIMESTAMP DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_timeline_date ON timeline_events(date);
         CREATE INDEX IF NOT EXISTS idx_timeline_type ON timeline_events(type);
 
         CREATE TABLE IF NOT EXISTS monitor_log (
-            id          SERIAL PRIMARY KEY,
-            timestamp   TIMESTAMP NOT NULL DEFAULT NOW(),
-            source      TEXT NOT NULL,
-            status      TEXT NOT NULL,
-            result      TEXT,
-            new_files   INTEGER DEFAULT 0,
+            id           SERIAL PRIMARY KEY,
+            timestamp    TIMESTAMP NOT NULL DEFAULT NOW(),
+            source       TEXT NOT NULL,
+            status       TEXT NOT NULL,
+            result       TEXT,
+            new_files    INTEGER DEFAULT 0,
             details_json TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_monitor_timestamp ON monitor_log(timestamp DESC);
 
         CREATE TABLE IF NOT EXISTS scraped_urls (
-            id          SERIAL PRIMARY KEY,
-            url         TEXT UNIQUE NOT NULL,
-            dataset_id  INTEGER,
-            first_seen  TIMESTAMP DEFAULT NOW(),
+            id           SERIAL PRIMARY KEY,
+            url          TEXT UNIQUE NOT NULL,
+            dataset_id   INTEGER,
+            first_seen   TIMESTAMP DEFAULT NOW(),
             last_checked TIMESTAMP DEFAULT NOW(),
-            file_type   TEXT,
-            downloaded  INTEGER DEFAULT 0
+            file_type    TEXT,
+            downloaded   INTEGER DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_scraped_downloaded ON scraped_urls(downloaded);
+        CREATE INDEX IF NOT EXISTS idx_scraped_dataset_downloaded ON scraped_urls(dataset_id, downloaded);
         """)
         cur.close()
     logger.info("PostgreSQL database initialized")
@@ -187,8 +197,8 @@ def insert_document(doc_data: dict) -> int:
             doc_data.get("s3_key"),
             doc_data.get("s3_url"),
             doc_data.get("sha256_hash"),
-            doc_data.get("date_on_doc"),
-            doc_data.get("date_downloaded", datetime.utcnow().isoformat()),
+            doc_data.get("date_on_doc"),  # should be a date or ISO date string accepted by Postgres
+            doc_data.get("date_downloaded", datetime.utcnow().date()),
             doc_data.get("source", "doj_efta"),
             doc_data.get("status", "downloaded"),
             json.dumps(doc_data.get("metadata", {})),
@@ -198,33 +208,51 @@ def insert_document(doc_data: dict) -> int:
         return row[0] if row else 0
 
 
+def get_document_by_file_id(file_id: str):
+    with get_db() as conn:
+        return query_one(conn, "SELECT * FROM documents WHERE file_id = %s", (file_id,))
+
+
 def get_documents(file_type=None, dataset_id=None, source=None,
                   sort="date_desc", search=None, limit=100, offset=0):
+    """
+    Document listing should stay fast at tens of thousands+ rows.
+    IMPORTANT: we intentionally do NOT search extracted_text here (ILIKE on big text fields will not scale).
+    Deep text search should be implemented later using Postgres FTS (tsvector) or OpenSearch.
+    """
     query = "SELECT * FROM documents WHERE 1=1"
     params = []
+
     if file_type and file_type != "all":
         query += " AND file_type = %s"
         params.append(file_type)
+
     if dataset_id:
         query += " AND dataset_id = %s"
         params.append(dataset_id)
+
     if source:
         query += " AND source = %s"
         params.append(source)
+
     if search:
-        query += " AND (title ILIKE %s OR filename ILIKE %s OR extracted_text ILIKE %s)"
+        # Fast, index-friendly-ish search on small columns only
+        query += " AND (title ILIKE %s OR filename ILIKE %s OR file_id ILIKE %s)"
         s = f"%{search}%"
         params.extend([s, s, s])
+
     sort_map = {
-        "date_desc": "date_on_doc DESC NULLS LAST",
-        "date_asc": "date_on_doc ASC NULLS LAST",
-        "name": "title ASC",
-        "size": "file_size DESC",
-        "newest_download": "date_downloaded DESC",
+        "date_desc": "date_on_doc DESC NULLS LAST, id DESC",
+        "date_asc": "date_on_doc ASC NULLS LAST, id ASC",
+        "name": "title ASC NULLS LAST, id DESC",
+        "size": "file_size DESC, id DESC",
+        "newest_download": "date_downloaded DESC, id DESC",
     }
-    query += f" ORDER BY {sort_map.get(sort, 'date_downloaded DESC')}"
+
+    query += f" ORDER BY {sort_map.get(sort, 'date_downloaded DESC, id DESC')}"
     query += " LIMIT %s OFFSET %s"
     params.extend([limit, offset])
+
     with get_db() as conn:
         return query_rows(conn, query, params)
 
@@ -232,12 +260,15 @@ def get_documents(file_type=None, dataset_id=None, source=None,
 def get_document_count(file_type=None, dataset_id=None):
     query = "SELECT COUNT(*) FROM documents WHERE 1=1"
     params = []
+
     if file_type and file_type != "all":
         query += " AND file_type = %s"
         params.append(file_type)
+
     if dataset_id:
         query += " AND dataset_id = %s"
         params.append(dataset_id)
+
     with get_db() as conn:
         return query_val(conn, query, params)
 
@@ -256,22 +287,29 @@ def document_exists(sha256_hash=None, source_url=None):
 
 
 def update_document_text(doc_id: int, extracted_text: str, persons_found: list):
+    """
+    Marks a document indexed once extracted_text exists.
+    Links persons found to the document and increments mentions.
+    """
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
             "UPDATE documents SET extracted_text = %s, status = 'indexed', updated_at = NOW() WHERE id = %s",
             (extracted_text, doc_id)
         )
+
         for person_name in persons_found:
-            row = query_val(conn, "SELECT id FROM persons WHERE name = %s", (person_name,))
-            if row:
+            person_id = query_val(conn, "SELECT id FROM persons WHERE name = %s", (person_name,))
+            if person_id:
+                # Link doc-person; unique constraint prevents duplicates
                 cur.execute(
                     "INSERT INTO document_persons (document_id, person_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                    (doc_id, row)
+                    (doc_id, person_id)
                 )
+                # Increment mentions (note: if you reprocess docs, this can drift unless you manage deltas)
                 cur.execute(
                     "UPDATE persons SET mentions = mentions + 1, updated_at = NOW() WHERE id = %s",
-                    (row,)
+                    (person_id,)
                 )
         cur.close()
 
@@ -298,16 +336,24 @@ def insert_person(name, role=None, status=None, category=None, mentions=0):
 def get_persons(category=None, search=None, sort="mentions_desc", limit=100):
     query = "SELECT * FROM persons WHERE 1=1"
     params = []
+
     if category and category != "all":
         query += " AND category = %s"
         params.append(category)
+
     if search:
         query += " AND (name ILIKE %s OR role ILIKE %s)"
         s = f"%{search}%"
         params.extend([s, s])
-    sort_map = {"mentions_desc": "mentions DESC", "name": "name ASC"}
-    query += f" ORDER BY {sort_map.get(sort, 'mentions DESC')} LIMIT %s"
+
+    sort_map = {
+        "mentions_desc": "mentions DESC, name ASC",
+        "mentions_asc": "mentions ASC, name ASC",
+        "name": "name ASC",
+    }
+    query += f" ORDER BY {sort_map.get(sort, 'mentions DESC, name ASC')} LIMIT %s"
     params.append(limit)
+
     with get_db() as conn:
         return query_rows(conn, query, params)
 
@@ -320,24 +366,31 @@ def get_timeline(person=None, event_type=None, year_start=None, year_end=None,
                  search=None, limit=200):
     query = "SELECT * FROM timeline_events WHERE 1=1"
     params = []
+
     if event_type and event_type != "all":
         query += " AND type = %s"
         params.append(event_type)
+
+    # date is DATE type, so use EXTRACT(YEAR FROM date)
     if year_start:
-        query += " AND CAST(SUBSTRING(date FROM 1 FOR 4) AS INTEGER) >= %s"
+        query += " AND EXTRACT(YEAR FROM date) >= %s"
         params.append(int(year_start))
     if year_end:
-        query += " AND CAST(SUBSTRING(date FROM 1 FOR 4) AS INTEGER) <= %s"
+        query += " AND EXTRACT(YEAR FROM date) <= %s"
         params.append(int(year_end))
+
     if person and person != "all":
         query += " AND persons_json ILIKE %s"
         params.append(f"%{person}%")
+
     if search:
         query += " AND (title ILIKE %s OR description ILIKE %s)"
         s = f"%{search}%"
         params.extend([s, s])
-    query += " ORDER BY date ASC LIMIT %s"
+
+    query += " ORDER BY date ASC, id ASC LIMIT %s"
     params.append(limit)
+
     with get_db() as conn:
         rows = query_rows(conn, query, params)
         for r in rows:
@@ -395,7 +448,8 @@ def get_undownloaded_urls(limit=500):
     with get_db() as conn:
         return query_rows(conn,
             "SELECT * FROM scraped_urls WHERE downloaded = 0 ORDER BY first_seen ASC LIMIT %s",
-            (limit,))
+            (limit,)
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -403,14 +457,25 @@ def get_undownloaded_urls(limit=500):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_stats():
+    """
+    Stats must be consistent with archive language:
+    - documents = downloaded/mirrored records (rows in documents)
+    - indexed_documents = documents with extracted_text processed (status='indexed')
+    - discovered/downloaded/pending = scraped_urls counters
+    """
     with get_db() as conn:
         total_docs = query_val(conn, "SELECT COUNT(*) FROM documents")
         total_pdfs = query_val(conn, "SELECT COUNT(*) FROM documents WHERE file_type='pdf'")
         total_images = query_val(conn, "SELECT COUNT(*) FROM documents WHERE file_type IN ('jpg','jpeg','png','tif','tiff')")
         total_videos = query_val(conn, "SELECT COUNT(*) FROM documents WHERE file_type IN ('mov','mp4')")
         total_persons = query_val(conn, "SELECT COUNT(*) FROM persons")
-        total_indexed = query_val(conn, "SELECT COUNT(*) FROM documents WHERE status='indexed'")
+        indexed_docs = query_val(conn, "SELECT COUNT(*) FROM documents WHERE status='indexed'")
         total_size = query_val(conn, "SELECT COALESCE(SUM(file_size),0) FROM documents")
+
+        discovered_urls = query_val(conn, "SELECT COUNT(*) FROM scraped_urls")
+        downloaded_urls = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE downloaded = 1")
+        pending_urls = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE downloaded = 0")
+
         last_log = query_one(conn, "SELECT * FROM monitor_log ORDER BY timestamp DESC LIMIT 1")
         recent_new = query_val(conn, "SELECT COALESCE(SUM(new_files),0) FROM monitor_log WHERE timestamp > NOW() - INTERVAL '7 days'")
 
@@ -419,13 +484,22 @@ def get_stats():
 
     return {
         "total_documents": total_docs,
+        "downloaded_documents": total_docs,  # explicit label for UI clarity
+        "indexed_documents": indexed_docs,
+
         "total_pdfs": total_pdfs,
         "total_images": total_images,
         "total_videos": total_videos,
+
         "total_persons": total_persons,
-        "total_indexed": total_indexed,
+
         "total_size_bytes": total_size,
         "total_size_human": _human_size(total_size),
+
+        "discovered_urls": discovered_urls,
+        "downloaded_urls": downloaded_urls,
+        "pending_urls": pending_urls,
+
         "new_files_this_week": recent_new,
         "last_check": last_log,
     }
