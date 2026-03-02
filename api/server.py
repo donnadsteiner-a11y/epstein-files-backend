@@ -30,8 +30,13 @@ logger = logging.getLogger("api")
 init_db()
 
 @app.route("/")
-def serve_index():
-    return send_from_directory(STATIC_DIR, "index.html")
+def root():
+    return jsonify({
+        "ok": True,
+        "service": "epstein-files-api",
+        "health": "/api/health",
+        "stats": "/api/stats"
+    })
 
 @app.route("/static/<path:path>")
 def serve_static(path):
