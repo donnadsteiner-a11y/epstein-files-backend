@@ -60,7 +60,7 @@ def run_daily_check():
     if pending > 0:
         logger.info("STEP 2: Downloading new files...")
         try:
-            downloaded, skipped, errors = process_downloads(limit=500)
+            downloaded, skipped, errors = process_downloads(limit=2000)
         except Exception as e:
             logger.error(f"Download failed: {e}")
             insert_monitor_log("doj_efta", "error", f"Download failed: {e}")
