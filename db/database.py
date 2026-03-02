@@ -78,9 +78,9 @@ def init_db():
             s3_key          TEXT,
             s3_url          TEXT,
             sha256_hash     TEXT,
-            date_on_doc     TEXT,
-            date_downloaded TEXT NOT NULL,
-            date_modified   TEXT,
+            date_on_doc     DATE,
+            date_downloaded DATE NOT NULL,
+            date_modified   DATE,
             source          TEXT DEFAULT 'doj_efta',
             status          TEXT DEFAULT 'downloaded',
             extracted_text  TEXT,
@@ -122,7 +122,7 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS timeline_events (
             id          SERIAL PRIMARY KEY,
-            date        TEXT NOT NULL,
+            date        DATE NOT NULL,
             type        TEXT NOT NULL,
             title       TEXT NOT NULL,
             description TEXT,
