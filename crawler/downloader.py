@@ -27,7 +27,7 @@ from db.database import (  # noqa: E402
 )
 
 # DOJ session helpers (age gate + QueueIT priming + PDF checks)
-from crawler.doj_session import build_doj_session, is_html_response, read_magic4  # noqa: E402
+from crawler.doj_session import build_doj_session, PDF_MAGIC  # noqa: E402
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
@@ -102,14 +102,20 @@ def download_file(url: str, dest_path: str) -> tuple[str, int, str]:
             if resp.status_code == 404:
                 return "missing", 0, ""
 
-            # If it's HTML (age gate, blocked, Akamai page), don't save it
-            if is_html_response(resp):
-                # quick re-prime for next attempt
-                try:
-                    session.get(
-                        "https://www.justice.gov/age-verify?destination=/epstein/files/",
-                        timeout=30,
-                        allow_redirects=True,
+         ct = (resp.headers.get("Content-Type") or "").lower()
+
+if "text/html" in ct or "application/xhtml" in ct:
+    try:
+        session.get(
+            "https://www.justice.gov/age-verify?destination=/epstein/files/",
+            timeout=30,
+            allow_redirects=True,
+        )
+    except Exception:
+        pass
+    raise requests.RequestException(
+        f"HTML response status={resp.status_code} ct={ct}"
+    )
                     )
                 except Exception:
                     pass
@@ -120,10 +126,14 @@ def download_file(url: str, dest_path: str) -> tuple[str, int, str]:
             # Validate PDF magic bytes
             sha256 = hashlib.sha256()
             total_size = 0
+magic = resp.raw.read(len(PDF_MAGIC))
+try:
+    resp.raw.decode_content = True
+except Exception:
+    pass
 
-            magic = read_magic4(resp)
-            if magic != b"%PDF":
-                raise requests.RequestException(f"NOT_PDF magic={magic!r} status={resp.status_code}")
+if magic != PDF_MAGIC:
+    raise requests.RequestException(f"NOT_PDF magic={magic!r} status={resp.status_code}")
 
             with open(dest_path, "wb") as f:
                 f.write(magic)
