@@ -40,7 +40,8 @@ logging.basicConfig(
 logger = logging.getLogger("downloader")
 
 # Use DOJ-hardened session (should include browser-like headers + cookies priming)
-session = build_doj_session(user_agent=USER_AGENT)
+session = build_doj_session()
+session.headers.update({"User-Agent": USER_AGENT})
 
 
 def get_s3_client():
