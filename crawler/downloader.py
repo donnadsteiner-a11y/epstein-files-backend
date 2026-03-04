@@ -25,6 +25,38 @@ def normalize_doj_url(url: str) -> str:
     if "/DataSet" in url:
         return url
 
+    import urllib.parse
+
+def relocate_dataset_pdf(url: str) -> str | None:
+    """
+    If url is .../DataSet XX/EFTA....pdf and returns 404,
+    try nearby datasets to find where the file actually lives.
+    Returns the working URL or None.
+    """
+    m = re.match(r"^https://www\.justice\.gov/epstein/files/DataSet%20(\d+)/((?:EFTA|EFTR)[^/]+\.pdf)$", url)
+    if not m:
+        return None
+
+    ds = int(m.group(1))
+    fn = m.group(2)
+
+    # try current, then neighbors (tune range if needed)
+    candidates = [ds] + [d for k in range(1, 6) for d in (ds - k, ds + k) if 1 <= d <= 99]
+
+    for d in candidates:
+        test_url = f"https://www.justice.gov/epstein/files/DataSet%20{d}/{fn}"
+        try:
+            r = session.get(test_url, stream=True, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            ct = (r.headers.get("Content-Type") or "").lower()
+
+            # only accept a real pdf
+            if r.status_code == 200 and "application/pdf" in ct:
+                return test_url
+        except requests.RequestException:
+            continue
+
+    return None
+
     m = re.match(r"https://www\.justice\.gov/epstein/files/(EFTA[^/]+\.pdf)", url)
     if m:
         filename = m.group(1)
