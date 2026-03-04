@@ -79,14 +79,70 @@ def get_content_type(file_type: str) -> str:
     }
     return types.get(file_type, "application/octet-stream")
 
-
 def download_file(url: str, dest_path: str) -> tuple[str, int, str]:
     """
-    Returns: (result, size_bytes, sha256_hex)
+    Download a DOJ file and verify it is a real PDF.
 
-    result:
-        ok
-        missing
+    Returns:
+        ("ok", size, sha256)
+        ("missing", 0, "")
+        ("error", 0, "")
+    """
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = session.get(
+                url,
+                stream=True,
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=True,
+            )
+
+            if resp.status_code == 404:
+                return "missing", 0, ""
+
+            ct = (resp.headers.get("Content-Type") or "").lower()
+
+            if "text/html" in ct:
+                raise requests.RequestException(
+                    f"HTML response status={resp.status_code} ct={ct}"
+                )
+
+            resp.raise_for_status()
+
+            sha256 = hashlib.sha256()
+            total_size = 0
+
+            magic = resp.raw.read(len(PDF_MAGIC))
+
+            if magic != PDF_MAGIC:
+                raise requests.RequestException(
+                    f"NOT_PDF magic={magic!r} status={resp.status_code}"
+                )
+
+            with open(dest_path, "wb") as f:
+                f.write(magic)
+                sha256.update(magic)
+                total_size += len(magic)
+
+                for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                    if chunk:
+                        f.write(chunk)
+                        sha256.update(chunk)
+                        total_size += len(chunk)
+
+            return "ok", total_size, sha256.hexdigest()
+
+        except requests.RequestException as e:
+            logger.warning(f"Download attempt {attempt+1} failed for {url}: {e}")
+            time.sleep(REQUEST_DELAY * (attempt + 1))
+
+            if os.path.exists(dest_path):
+                try:
+                    os.remove(dest_path)
+                except Exception:
+                    pass
+
 
 
 def upload_to_s3(s3, local_path: str, s3_key: str, content_type: str | None = None) -> str:
