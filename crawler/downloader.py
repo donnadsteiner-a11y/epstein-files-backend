@@ -183,6 +183,7 @@ def process_downloads(limit: int = 500):
     url = entry["url"]
     url = normalize_doj_url(url)
     dataset_id = entry.get("dataset_id")
+    file_type = entry.get("file_type", "pdf")
 
         logger.info(f"[{i+1}/{len(pending)}] Downloading: {url}")
 
