@@ -15,9 +15,12 @@ import requests
 import boto3
 from botocore.config import Config as BotoConfig
 
+import psycopg
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import (  # noqa: E402
+    DATABASE_URL,
     S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_PUBLIC_URL,
     TEMP_DOWNLOAD_DIR, REQUEST_DELAY, REQUEST_TIMEOUT, MAX_RETRIES,
     USER_AGENT, CHUNK_SIZE, LOG_DIR
@@ -29,6 +32,21 @@ from db.database import (  # noqa: E402
 
 # DOJ session helpers (age gate + QueueIT priming + PDF checks)
 from crawler.doj_session import build_doj_session, PDF_MAGIC  # noqa: E402
+
+
+# =============================
+# Tunables
+# =============================
+
+# How many sequential "true missing" (after relocation attempts) we tolerate
+# for the same (dataset + prefix) before bulk-marking the rest.
+# Keep this conservative to avoid false negatives.
+MISSING_STREAK_TRIGGER = 25
+
+# Prefix definition: drop last N digits from the numeric tail (usually 2 works well)
+# E.g. EFTA00800101 -> prefix EFTA008001
+NUMERIC_SUFFIX_DROP = 2
+
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
@@ -148,6 +166,25 @@ def locate_dataset_for_bare_url(url: str, max_dataset: int = 99) -> str | None:
     return None
 
 
+def _dataset_and_filename(url: str) -> tuple[int | None, str | None]:
+    m = _DOJ_DATASET_RE.match(url)
+    if not m:
+        return None, None
+    return int(m.group(1)), m.group(2)
+
+
+def _prefix_for_filename(filename: str) -> str:
+    """
+    Build a conservative prefix for bulk-missing.
+    Example:
+      EFTA00800101.pdf -> stem EFTA00800101 -> prefix EFTA008001 (drop last 2 digits)
+    """
+    stem = filename[:-4] if filename.lower().endswith(".pdf") else filename
+    if len(stem) <= NUMERIC_SUFFIX_DROP:
+        return stem
+    return stem[:-NUMERIC_SUFFIX_DROP]
+
+
 # -----------------------------
 # S3 helpers
 # -----------------------------
@@ -186,6 +223,35 @@ def get_content_type(file_type: str) -> str:
         "tiff": "image/tiff",
     }
     return types.get(file_type, "application/octet-stream")
+
+
+# -----------------------------
+# Bulk-missing helper
+# -----------------------------
+
+def bulk_mark_missing_by_prefix(dataset_id: int, prefix: str, reason: str) -> int:
+    """
+    Mark ALL pending scraped_urls matching this dataset+prefix pattern as missing.
+    This is the acceleration trick.
+    """
+    pattern = f"https://www.justice.gov/epstein/files/DataSet%20{dataset_id}/{prefix}%.pdf"
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE scraped_urls
+                SET status='missing',
+                    downloaded=1,
+                    last_checked=NOW(),
+                    last_error=%s
+                WHERE status='pending'
+                  AND url LIKE %s
+                """,
+                (reason, pattern),
+            )
+            updated = cur.rowcount or 0
+        conn.commit()
+    return updated
 
 
 # -----------------------------
@@ -234,7 +300,6 @@ def download_file(url: str, dest_path: str) -> tuple[str, int, str, str]:
             ct = (resp.headers.get("Content-Type") or "").lower()
             if "text/html" in ct:
                 resp.close()
-                # Gate page or error page; attempt relocation if dataset-structured
                 relocated = relocate_dataset_pdf(final_url)
                 if relocated and relocated != final_url:
                     logger.info(f"  HTML response; relocating: {final_url} -> {relocated}")
@@ -251,7 +316,6 @@ def download_file(url: str, dest_path: str) -> tuple[str, int, str, str]:
             magic = resp.raw.read(len(PDF_MAGIC))
             if magic != PDF_MAGIC:
                 resp.close()
-                # Not a PDF. Try relocation if possible.
                 relocated = relocate_dataset_pdf(final_url)
                 if relocated and relocated != final_url:
                     logger.info(f"  NOT_PDF; relocating: {final_url} -> {relocated}")
@@ -312,6 +376,14 @@ def process_downloads(limit: int = 500):
     missing = 0
     skipped_dupe = 0
     errors = 0
+    bulk_skipped = 0
+
+    # 404 streak tracking
+    streak_key: tuple[int, str] | None = None  # (dataset_id, prefix)
+    streak_count = 0
+
+    # if we bulk-mark (dataset,prefix), skip further urls matching it during this run
+    bulk_blocked: set[tuple[int, str]] = set()
 
     for i, entry in enumerate(pending):
         original_url = entry["url"]
@@ -320,12 +392,19 @@ def process_downloads(limit: int = 500):
 
         url = normalize_doj_url(original_url, dataset_id)
 
+        # fast-skip if already bulk-blocked (avoid wasting requests in this same run)
+        ds_u, fn_u = _dataset_and_filename(url)
+        if ds_u and fn_u:
+            pref_u = _prefix_for_filename(fn_u)
+            if (ds_u, pref_u) in bulk_blocked:
+                bulk_skipped += 1
+                continue
+
         logger.info(f"[{i+1}/{len(pending)}] Downloading: {url}")
 
         parsed = urlparse(url)
         filename = os.path.basename(parsed.path) or f"file_{i}.{file_type}"
         filename = "".join(c for c in filename if c.isalnum() or c in ".-_ ").strip() or f"file_{i}.{file_type}"
-
         temp_path = os.path.join(TEMP_DOWNLOAD_DIR, filename)
 
         result, file_size, sha256, final_url = download_file(url, temp_path)
@@ -340,20 +419,56 @@ def process_downloads(limit: int = 500):
                 try:
                     update_scraped_dataset_id(original_url, final_ds)
                 except Exception as e:
-                    logger.warning(
-                        f"  Could not update scraped_urls.dataset_id for {original_url}: {e}"
-                    )
+                    logger.warning(f"  Could not update scraped_urls.dataset_id for {original_url}: {e}")
 
         if result == "missing":
             logger.info(f"  NOT_FOUND (404): {final_url}")
-            # terminal: mark as missing so it doesn't churn, and is distinguishable from real downloads
             mark_url_scraped(original_url, downloaded=True, status="missing")
             missing += 1
+
+            # streak logic uses final_url (post-relocation) so we only bulk-mark when
+            # relocation ALSO failed repeatedly.
+            ds_f, fn_f = _dataset_and_filename(final_url)
+            if ds_f and fn_f:
+                prefix = _prefix_for_filename(fn_f)
+                key = (ds_f, prefix)
+
+                if streak_key == key:
+                    streak_count += 1
+                else:
+                    streak_key = key
+                    streak_count = 1
+
+                if streak_count >= MISSING_STREAK_TRIGGER and key not in bulk_blocked:
+                    reason = f"bulk_missing_streak:{ds_f}:{prefix}"
+                    try:
+                        updated = bulk_mark_missing_by_prefix(ds_f, prefix, reason)
+                        bulk_blocked.add(key)
+                        logger.warning(
+                            f"  BULK-MISSING triggered for DataSet {ds_f} prefix {prefix}% "
+                            f"(streak={streak_count}) updated_rows={updated}"
+                        )
+                    except Exception as e:
+                        logger.warning(f"  BULK-MISSING failed for {key}: {e}")
+                    finally:
+                        # reset streak after attempting bulk action
+                        streak_key = None
+                        streak_count = 0
+
             continue
+
+        # reset streak on any non-missing outcome
+        streak_key = None
+        streak_count = 0
 
         if result != "ok":
             logger.error(f"  Failed to download: {final_url} (result={result})")
             errors += 1
+            # optional: mark error
+            try:
+                mark_url_scraped(original_url, downloaded=False, status="error", last_error=f"download_error:{result}")
+            except Exception:
+                pass
             continue
 
         if document_exists(sha256_hash=sha256):
@@ -369,6 +484,10 @@ def process_downloads(limit: int = 500):
         except Exception as e:
             logger.error(f"  S3 upload failed: {e}")
             errors += 1
+            try:
+                mark_url_scraped(original_url, downloaded=False, status="error", last_error=f"s3_upload_failed:{e}")
+            except Exception:
+                pass
             if os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
@@ -394,7 +513,6 @@ def process_downloads(limit: int = 500):
             "status": "downloaded",
         })
 
-        # Mark the original scraped URL as done so we don't requeue it forever.
         mark_url_scraped(original_url, downloaded=True, status="downloaded")
 
         if os.path.exists(temp_path):
@@ -408,7 +526,7 @@ def process_downloads(limit: int = 500):
 
     logger.info(
         f"\nDownload complete: {downloaded} downloaded, {missing} missing(404), "
-        f"{skipped_dupe} dupes, {errors} errors"
+        f"{skipped_dupe} dupes, {errors} errors, {bulk_skipped} bulk-skipped"
     )
     return downloaded, missing, skipped_dupe, errors
 
