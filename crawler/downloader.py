@@ -22,7 +22,7 @@ from config.settings import (  # noqa: E402
     TEMP_DOWNLOAD_DIR, REQUEST_DELAY, REQUEST_TIMEOUT, MAX_RETRIES,
     USER_AGENT, CHUNK_SIZE, LOG_DIR
 )
-from db.database import (
+from db.database import (  # noqa: E402
     init_db, get_undownloaded_urls, mark_url_scraped,
     insert_document, document_exists, update_scraped_dataset_id
 )
@@ -55,6 +55,7 @@ _DOJ_DATASET_RE = re.compile(
 _DOJ_BARE_RE = re.compile(
     r"^https://www\.justice\.gov/epstein/files/((?:EFTA|EFTR)[^/]+\.pdf)$"
 )
+
 
 def normalize_doj_url(url: str, dataset_id: int | None = None) -> str:
     """
@@ -327,26 +328,26 @@ def process_downloads(limit: int = 500):
 
         temp_path = os.path.join(TEMP_DOWNLOAD_DIR, filename)
 
-result, file_size, sha256, final_url = download_file(url, temp_path)
+        result, file_size, sha256, final_url = download_file(url, temp_path)
 
-# If we relocated to another dataset, trust final_url and fix dataset_id
-m = _DOJ_DATASET_RE.match(final_url)
-if m:
-    final_ds = int(m.group(1))
-    if dataset_id != final_ds:
-        logger.info(f"  Dataset corrected: {dataset_id} -> {final_ds}")
-        dataset_id = final_ds
+        # If we relocated to another dataset, trust final_url and fix dataset_id
+        m = _DOJ_DATASET_RE.match(final_url)
+        if m:
+            final_ds = int(m.group(1))
+            if dataset_id != final_ds:
+                logger.info(f"  Dataset corrected: {dataset_id} -> {final_ds}")
+                dataset_id = final_ds
+                try:
+                    update_scraped_dataset_id(original_url, final_ds)
+                except Exception as e:
+                    logger.warning(
+                        f"  Could not update scraped_urls.dataset_id for {original_url}: {e}"
+                    )
 
-        try:
-            update_scraped_dataset_id(original_url, final_ds)
-        except Exception as e:
-            logger.warning(
-                f"  Could not update scraped_urls.dataset_id for {original_url}: {e}"
-            )
-      
         if result == "missing":
             logger.info(f"  NOT_FOUND (404): {final_url}")
-            mark_url_scraped(original_url, downloaded=True)  # terminal
+            # terminal: don't keep retrying forever
+            mark_url_scraped(original_url, downloaded=True)
             missing += 1
             continue
 
@@ -369,7 +370,10 @@ if m:
             logger.error(f"  S3 upload failed: {e}")
             errors += 1
             if os.path.exists(temp_path):
-                os.remove(temp_path)
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
             continue
 
         file_id = f"DS{dataset_id or 0}-{sha256[:8]}"
@@ -381,7 +385,7 @@ if m:
             "file_type": file_type,
             "file_size": file_size,
             "dataset_id": dataset_id,
-            "source_url": final_url,      # store the URL that actually worked
+            "source_url": final_url,  # store the URL that actually worked
             "s3_key": s3_key,
             "s3_url": s3_url,
             "sha256_hash": sha256,
@@ -394,7 +398,10 @@ if m:
         mark_url_scraped(original_url, downloaded=True)
 
         if os.path.exists(temp_path):
-            os.remove(temp_path)
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
         downloaded += 1
         time.sleep(REQUEST_DELAY)
