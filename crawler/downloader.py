@@ -22,9 +22,9 @@ from config.settings import (  # noqa: E402
     TEMP_DOWNLOAD_DIR, REQUEST_DELAY, REQUEST_TIMEOUT, MAX_RETRIES,
     USER_AGENT, CHUNK_SIZE, LOG_DIR
 )
-from db.database import (  # noqa: E402
+from db.database import (
     init_db, get_undownloaded_urls, mark_url_scraped,
-    insert_document, document_exists
+    insert_document, document_exists, update_scraped_dataset_id
 )
 
 # DOJ session helpers (age gate + QueueIT priming + PDF checks)
@@ -328,6 +328,20 @@ def process_downloads(limit: int = 500):
         temp_path = os.path.join(TEMP_DOWNLOAD_DIR, filename)
 
         result, file_size, sha256, final_url = download_file(url, temp_path)
+
+        # If we relocated to another dataset, trust final_url and fix dataset_id
+m = _DOJ_DATASET_RE.match(final_url)
+if m:
+    final_ds = int(m.group(1))
+    if dataset_id != final_ds:
+        logger.info(f"  Dataset corrected: {dataset_id} -> {final_ds}")
+        dataset_id = final_ds
+
+        # Persist the correction so we don't keep probing next run
+        try:
+            update_scraped_dataset_id(original_url, final_ds)
+        except Exception as e:
+            logger.warning(f"  Could not update scraped_urls.dataset_id for {original_url}: {e}")
 
         if result == "missing":
             logger.info(f"  NOT_FOUND (404): {final_url}")
