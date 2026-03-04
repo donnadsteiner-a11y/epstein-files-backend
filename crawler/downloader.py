@@ -15,15 +15,18 @@ import boto3
 from botocore.config import Config as BotoConfig
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.settings import (
+from config.settings import (  # noqa: E402
     S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_PUBLIC_URL,
     TEMP_DOWNLOAD_DIR, REQUEST_DELAY, REQUEST_TIMEOUT, MAX_RETRIES,
     USER_AGENT, CHUNK_SIZE, LOG_DIR
 )
-from db.database import (
+from db.database import (  # noqa: E402
     init_db, get_undownloaded_urls, mark_url_scraped,
-    insert_document, document_exists, get_db, query_val
+    insert_document, document_exists
 )
+
+# NEW: DOJ session helpers (age gate + QueueIT priming + PDF checks)
+from crawler.doj_session import build_doj_session, is_html_response, read_magic4  # noqa: E402
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
@@ -31,13 +34,12 @@ os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-    ]
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger("downloader")
 
-session = requests.Session()
+# Use DOJ-hardened session
+session = build_doj_session()
 session.headers.update({"User-Agent": USER_AGENT})
 
 
@@ -64,24 +66,73 @@ def ensure_bucket_exists(s3):
 
 
 def download_file(url: str, dest_path: str) -> tuple[bool, int, str]:
+    """
+    Returns: (success, size_bytes, sha256_hex)
+
+    Hardened for DOJ:
+    - primes cookies via build_doj_session()
+    - rejects HTML responses
+    - validates PDF magic bytes (%PDF)
+    - writes magic bytes + rest of stream
+    """
     for attempt in range(MAX_RETRIES):
         try:
-            resp = session.get(url, stream=True, timeout=REQUEST_TIMEOUT)
+            resp = session.get(
+                url,
+                stream=True,
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=True,
+            )
+
+            # Explicit 404 handling
+            if resp.status_code == 404:
+                return False, 0, ""
+
+            # If it's HTML (age gate, blocked, Akamai page), don't save it
+            if is_html_response(resp):
+                # Try one quick re-prime and fail this attempt
+                try:
+                    session.get(
+                        "https://www.justice.gov/age-verify?destination=/epstein/files/",
+                        timeout=30,
+                        allow_redirects=True,
+                    )
+                except Exception:
+                    pass
+                raise requests.RequestException(f"HTML response for {url} status={resp.status_code}")
+
             resp.raise_for_status()
+
+            # Validate PDF magic bytes
             sha256 = hashlib.sha256()
             total_size = 0
+
+            magic = read_magic4(resp)
+            if magic != b"%PDF":
+                raise requests.RequestException(f"NOT_PDF magic={magic!r} status={resp.status_code}")
+
             with open(dest_path, "wb") as f:
+                f.write(magic)
+                sha256.update(magic)
+                total_size += len(magic)
+
                 for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                     if chunk:
                         f.write(chunk)
                         sha256.update(chunk)
                         total_size += len(chunk)
+
             return True, total_size, sha256.hexdigest()
+
         except requests.RequestException as e:
             logger.warning(f"Download attempt {attempt+1} failed for {url}: {e}")
             time.sleep(REQUEST_DELAY * (attempt + 1))
             if os.path.exists(dest_path):
-                os.remove(dest_path)
+                try:
+                    os.remove(dest_path)
+                except Exception:
+                    pass
+
     return False, 0, ""
 
 
@@ -153,7 +204,10 @@ def process_downloads(limit: int = 500):
             logger.error(f"  S3 upload failed: {e}")
             errors += 1
             if os.path.exists(temp_path):
-                os.remove(temp_path)
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
             continue
 
         file_id = f"DS{dataset_id or 0}-{sha256[:8]}"
@@ -177,9 +231,12 @@ def process_downloads(limit: int = 500):
         mark_url_scraped(url, downloaded=True)
 
         if os.path.exists(temp_path):
-            os.remove(temp_path)
-        downloaded += 1
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
+        downloaded += 1
         time.sleep(REQUEST_DELAY)
 
     logger.info(f"\nDownload complete: {downloaded} downloaded, {skipped} skipped (dupes), {errors} errors")
@@ -191,7 +248,7 @@ if __name__ == "__main__":
     downloaded, skipped, errors = process_downloads()
 
     print(f"\n{'='*50}")
-    print(f"Download Summary")
+    print("Download Summary")
     print(f"{'='*50}")
     print(f"Downloaded:  {downloaded}")
     print(f"Skipped:     {skipped} (duplicates)")
