@@ -444,6 +444,20 @@ def mark_url_scraped(url, dataset_id=None, file_type=None, downloaded=True):
         cur.close()
 
 
+def update_scraped_dataset_id(url: str, dataset_id: int) -> None:
+    """
+    Update dataset_id for an already-discovered URL.
+    Used when the downloader relocates a PDF into the correct DataSet folder.
+    """
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE scraped_urls SET dataset_id = %s, last_checked = NOW() WHERE url = %s",
+            (dataset_id, url),
+        )
+        cur.close()
+
+
 def get_undownloaded_urls(limit=500):
     with get_db() as conn:
         return query_rows(conn,
