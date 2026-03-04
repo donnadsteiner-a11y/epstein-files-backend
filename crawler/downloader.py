@@ -424,4 +424,4 @@ if __name__ == "__main__":
     print(f"Missing:     {missing} (404)")
     print(f"Duplicates:  {dupes} (sha256)")
     print(f"Errors:      {errors}")
-downloaded, missing, dupes, errors = process_downloads(limit=5)
+downloaded, missing, dupes, errors = process_downloads()
