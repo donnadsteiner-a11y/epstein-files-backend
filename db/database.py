@@ -14,7 +14,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.settings import DATABASE_URL
+from config.settings import DATABASE_URL  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +62,11 @@ def query_val(conn, sql, params=None):
 
 
 def init_db():
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist, and apply safe schema upgrades."""
     with get_db() as conn:
         cur = conn.cursor()
+
+        # Base tables
         cur.execute("""
         CREATE TABLE IF NOT EXISTS documents (
             id              SERIAL PRIMARY KEY,
@@ -162,12 +164,41 @@ def init_db():
             first_seen   TIMESTAMP DEFAULT NOW(),
             last_checked TIMESTAMP DEFAULT NOW(),
             file_type    TEXT,
-            downloaded   INTEGER DEFAULT 0
+            downloaded   INTEGER DEFAULT 0,
+
+            -- Step 1: real statuses for robust ingestion
+            status       TEXT,
+            fail_count   INTEGER NOT NULL DEFAULT 0,
+            last_error   TEXT
         );
+
         CREATE INDEX IF NOT EXISTS idx_scraped_downloaded ON scraped_urls(downloaded);
         CREATE INDEX IF NOT EXISTS idx_scraped_dataset_downloaded ON scraped_urls(dataset_id, downloaded);
+
+        -- Step 1 indexes
+        CREATE INDEX IF NOT EXISTS idx_scraped_status ON scraped_urls(status);
+        CREATE INDEX IF NOT EXISTS idx_scraped_status_dataset ON scraped_urls(status, dataset_id);
         """)
+
+        # Safe upgrades if table existed before Step 1
+        cur.execute("""
+        ALTER TABLE scraped_urls
+          ADD COLUMN IF NOT EXISTS status TEXT;
+        ALTER TABLE scraped_urls
+          ADD COLUMN IF NOT EXISTS fail_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE scraped_urls
+          ADD COLUMN IF NOT EXISTS last_error TEXT;
+        """)
+
+        # Backfill status if missing
+        cur.execute("""
+        UPDATE scraped_urls
+        SET status = CASE WHEN downloaded = 1 THEN 'downloaded' ELSE 'pending' END
+        WHERE status IS NULL;
+        """)
+
         cur.close()
+
     logger.info("PostgreSQL database initialized")
 
 
@@ -197,7 +228,7 @@ def insert_document(doc_data: dict) -> int:
             doc_data.get("s3_key"),
             doc_data.get("s3_url"),
             doc_data.get("sha256_hash"),
-            doc_data.get("date_on_doc"),  # should be a date or ISO date string accepted by Postgres
+            doc_data.get("date_on_doc"),
             doc_data.get("date_downloaded", datetime.utcnow().date()),
             doc_data.get("source", "doj_efta"),
             doc_data.get("status", "downloaded"),
@@ -236,7 +267,6 @@ def get_documents(file_type=None, dataset_id=None, source=None,
         params.append(source)
 
     if search:
-        # Fast, index-friendly-ish search on small columns only
         query += " AND (title ILIKE %s OR filename ILIKE %s OR file_id ILIKE %s)"
         s = f"%{search}%"
         params.extend([s, s, s])
@@ -301,12 +331,10 @@ def update_document_text(doc_id: int, extracted_text: str, persons_found: list):
         for person_name in persons_found:
             person_id = query_val(conn, "SELECT id FROM persons WHERE name = %s", (person_name,))
             if person_id:
-                # Link doc-person; unique constraint prevents duplicates
                 cur.execute(
                     "INSERT INTO document_persons (document_id, person_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
                     (doc_id, person_id)
                 )
-                # Increment mentions (note: if you reprocess docs, this can drift unless you manage deltas)
                 cur.execute(
                     "UPDATE persons SET mentions = mentions + 1, updated_at = NOW() WHERE id = %s",
                     (person_id,)
@@ -371,7 +399,6 @@ def get_timeline(person=None, event_type=None, year_start=None, year_end=None,
         query += " AND type = %s"
         params.append(event_type)
 
-    # date is DATE type, so use EXTRACT(YEAR FROM date)
     if year_start:
         query += " AND EXTRACT(YEAR FROM date) >= %s"
         params.append(int(year_start))
@@ -422,46 +449,55 @@ def get_monitor_log(limit=50):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SCRAPED URL TRACKING
+# SCRAPED URL TRACKING (Step 1)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def url_already_scraped(url):
     with get_db() as conn:
-        r = query_val(conn, "SELECT downloaded FROM scraped_urls WHERE url = %s", (url,))
-        return r == 1
+        r = query_val(conn, "SELECT status FROM scraped_urls WHERE url = %s", (url,))
+        return r in ("downloaded", "missing")
 
 
-def mark_url_scraped(url, dataset_id=None, file_type=None, downloaded=True):
+def mark_url_scraped(url, dataset_id=None, file_type=None, downloaded=True, status=None, last_error=None):
+    """
+    status: pending | downloaded | missing | error
+    downloaded: legacy boolean-ish flag kept for compatibility
+    """
+    if status is None:
+        status = "downloaded" if downloaded else "pending"
+
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO scraped_urls (url, dataset_id, file_type, downloaded, last_checked)
-            VALUES (%s, %s, %s, %s, NOW())
+            INSERT INTO scraped_urls (url, dataset_id, file_type, downloaded, status, last_error, last_checked)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT(url) DO UPDATE SET
                 last_checked=NOW(),
-                downloaded=EXCLUDED.downloaded
-        """, (url, dataset_id, file_type, 1 if downloaded else 0))
+                dataset_id=COALESCE(EXCLUDED.dataset_id, scraped_urls.dataset_id),
+                file_type=COALESCE(EXCLUDED.file_type, scraped_urls.file_type),
+                downloaded=EXCLUDED.downloaded,
+                status=EXCLUDED.status,
+                last_error=COALESCE(EXCLUDED.last_error, scraped_urls.last_error)
+        """, (url, dataset_id, file_type, 1 if downloaded else 0, status, last_error))
         cur.close()
 
 
 def update_scraped_dataset_id(url: str, dataset_id: int) -> None:
-    """
-    Update dataset_id for an already-discovered URL.
-    Used when the downloader relocates a PDF into the correct DataSet folder.
-    """
+    """Persist corrected dataset_id for a scraped URL (used by downloader relocation logic)."""
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
             "UPDATE scraped_urls SET dataset_id = %s, last_checked = NOW() WHERE url = %s",
-            (dataset_id, url),
+            (int(dataset_id), url),
         )
         cur.close()
 
 
 def get_undownloaded_urls(limit=500):
     with get_db() as conn:
-        return query_rows(conn,
-            "SELECT * FROM scraped_urls WHERE downloaded = 0 ORDER BY first_seen ASC LIMIT %s",
+        return query_rows(
+            conn,
+            "SELECT * FROM scraped_urls WHERE status = 'pending' ORDER BY first_seen ASC LIMIT %s",
             (limit,)
         )
 
@@ -487,8 +523,10 @@ def get_stats():
         total_size = query_val(conn, "SELECT COALESCE(SUM(file_size),0) FROM documents")
 
         discovered_urls = query_val(conn, "SELECT COUNT(*) FROM scraped_urls")
-        downloaded_urls = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE downloaded = 1")
-        pending_urls = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE downloaded = 0")
+        downloaded_urls = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE status='downloaded'")
+        pending_urls = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE status='pending'")
+        missing_urls = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE status='missing'")
+        error_urls = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE status='error'")
 
         last_log = query_one(conn, "SELECT * FROM monitor_log ORDER BY timestamp DESC LIMIT 1")
         recent_new = query_val(conn, "SELECT COALESCE(SUM(new_files),0) FROM monitor_log WHERE timestamp > NOW() - INTERVAL '7 days'")
@@ -498,7 +536,7 @@ def get_stats():
 
     return {
         "total_documents": total_docs,
-        "downloaded_documents": total_docs,  # explicit label for UI clarity
+        "downloaded_documents": total_docs,
         "indexed_documents": indexed_docs,
 
         "total_pdfs": total_pdfs,
@@ -513,6 +551,8 @@ def get_stats():
         "discovered_urls": discovered_urls,
         "downloaded_urls": downloaded_urls,
         "pending_urls": pending_urls,
+        "missing_urls": missing_urls,
+        "error_urls": error_urls,
 
         "new_files_this_week": recent_new,
         "last_check": last_log,
