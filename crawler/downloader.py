@@ -7,7 +7,7 @@ import sys
 import time
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests
