@@ -346,8 +346,8 @@ def process_downloads(limit: int = 500):
 
         if result == "missing":
             logger.info(f"  NOT_FOUND (404): {final_url}")
-            # terminal: don't keep retrying forever
-            mark_url_scraped(original_url, downloaded=True)
+            # terminal: mark as missing so it doesn't churn, and is distinguishable from real downloads
+            mark_url_scraped(original_url, downloaded=True, status="missing")
             missing += 1
             continue
 
@@ -395,7 +395,7 @@ def process_downloads(limit: int = 500):
         })
 
         # Mark the original scraped URL as done so we don't requeue it forever.
-        mark_url_scraped(original_url, downloaded=True)
+        mark_url_scraped(original_url, downloaded=True, status="downloaded")
 
         if os.path.exists(temp_path):
             try:
@@ -424,4 +424,3 @@ if __name__ == "__main__":
     print(f"Missing:     {missing} (404)")
     print(f"Duplicates:  {dupes} (sha256)")
     print(f"Errors:      {errors}")
-downloaded, missing, dupes, errors = process_downloads()
