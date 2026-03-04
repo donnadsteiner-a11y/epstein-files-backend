@@ -14,6 +14,19 @@ import requests
 import boto3
 from botocore.config import Config as BotoConfig
 
+import re
+
+def normalize_doj_url(url: str) -> str:
+    """
+    DOJ sometimes lists files as /epstein/files/EFTAxxxxx.pdf
+    but the real file lives under /epstein/files/DataSet 10/.
+    """
+    m = re.match(r"https://www\.justice\.gov/epstein/files/(EFTA[^/]+\.pdf)", url)
+    if m:
+        filename = m.group(1)
+        return f"https://www.justice.gov/epstein/files/DataSet%2010/{filename}"
+    return url
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import (  # noqa: E402
@@ -167,9 +180,9 @@ def process_downloads(limit: int = 500):
     errors = 0
 
     for i, entry in enumerate(pending):
-        url = entry["url"]
-        dataset_id = entry.get("dataset_id")
-        file_type = entry.get("file_type", "pdf")
+    url = entry["url"]
+    url = normalize_doj_url(url)
+    dataset_id = entry.get("dataset_id")
 
         logger.info(f"[{i+1}/{len(pending)}] Downloading: {url}")
 
