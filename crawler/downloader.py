@@ -15,6 +15,7 @@ import boto3
 from botocore.config import Config as BotoConfig
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from config.settings import (  # noqa: E402
     S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_PUBLIC_URL,
     TEMP_DOWNLOAD_DIR, REQUEST_DELAY, REQUEST_TIMEOUT, MAX_RETRIES,
@@ -25,7 +26,7 @@ from db.database import (  # noqa: E402
     insert_document, document_exists
 )
 
-# NEW: DOJ session helpers (age gate + QueueIT priming + PDF checks)
+# DOJ session helpers (age gate + QueueIT priming + PDF checks)
 from crawler.doj_session import build_doj_session, is_html_response, read_magic4  # noqa: E402
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -38,9 +39,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("downloader")
 
-# Use DOJ-hardened session
-session = build_doj_session()
-session.headers.update({"User-Agent": USER_AGENT})
+# Use DOJ-hardened session (should include browser-like headers + cookies priming)
+session = build_doj_session(user_agent=USER_AGENT)
 
 
 def get_s3_client():
@@ -65,15 +65,29 @@ def ensure_bucket_exists(s3):
         s3.create_bucket(Bucket=S3_BUCKET)
 
 
-def download_file(url: str, dest_path: str) -> tuple[bool, int, str]:
-    """
-    Returns: (success, size_bytes, sha256_hex)
+def get_content_type(file_type: str) -> str:
+    types = {
+        "pdf": "application/pdf",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "mov": "video/quicktime",
+        "mp4": "video/mp4",
+        "tif": "image/tiff",
+        "tiff": "image/tiff",
+    }
+    return types.get(file_type, "application/octet-stream")
 
-    Hardened for DOJ:
-    - primes cookies via build_doj_session()
-    - rejects HTML responses
-    - validates PDF magic bytes (%PDF)
-    - writes magic bytes + rest of stream
+
+def download_file(url: str, dest_path: str) -> tuple[str, int, str]:
+    """
+    Returns: (result, size_bytes, sha256_hex)
+
+    result:
+      - "ok"
+      - "missing"   (404)
+      - "blocked"   (HTML gate / akamai page)
+      - "error"     (other)
     """
     for attempt in range(MAX_RETRIES):
         try:
@@ -84,13 +98,12 @@ def download_file(url: str, dest_path: str) -> tuple[bool, int, str]:
                 allow_redirects=True,
             )
 
-            # Explicit 404 handling
             if resp.status_code == 404:
-                return False, 0, ""
+                return "missing", 0, ""
 
             # If it's HTML (age gate, blocked, Akamai page), don't save it
             if is_html_response(resp):
-                # Try one quick re-prime and fail this attempt
+                # quick re-prime for next attempt
                 try:
                     session.get(
                         "https://www.justice.gov/age-verify?destination=/epstein/files/",
@@ -99,7 +112,7 @@ def download_file(url: str, dest_path: str) -> tuple[bool, int, str]:
                     )
                 except Exception:
                     pass
-                raise requests.RequestException(f"HTML response for {url} status={resp.status_code}")
+                raise requests.RequestException(f"HTML response status={resp.status_code}")
 
             resp.raise_for_status()
 
@@ -122,7 +135,7 @@ def download_file(url: str, dest_path: str) -> tuple[bool, int, str]:
                         sha256.update(chunk)
                         total_size += len(chunk)
 
-            return True, total_size, sha256.hexdigest()
+            return "ok", total_size, sha256.hexdigest()
 
         except requests.RequestException as e:
             logger.warning(f"Download attempt {attempt+1} failed for {url}: {e}")
@@ -133,30 +146,18 @@ def download_file(url: str, dest_path: str) -> tuple[bool, int, str]:
                 except Exception:
                     pass
 
-    return False, 0, ""
+    # If we exhausted retries, categorize as blocked vs error based on last known condition is hard.
+    # Call it "error" and let caller decide how to mark.
+    return "error", 0, ""
 
 
-def upload_to_s3(s3, local_path: str, s3_key: str, content_type: str = None) -> str:
+def upload_to_s3(s3, local_path: str, s3_key: str, content_type: str | None = None) -> str:
     extra_args = {}
     if content_type:
         extra_args["ContentType"] = content_type
 
     s3.upload_file(local_path, S3_BUCKET, s3_key, ExtraArgs=extra_args)
     return f"{S3_PUBLIC_URL}/{s3_key}"
-
-
-def get_content_type(file_type: str) -> str:
-    types = {
-        "pdf": "application/pdf",
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "png": "image/png",
-        "mov": "video/quicktime",
-        "mp4": "video/mp4",
-        "tif": "image/tiff",
-        "tiff": "image/tiff",
-    }
-    return types.get(file_type, "application/octet-stream")
 
 
 def process_downloads(limit: int = 500):
@@ -167,7 +168,8 @@ def process_downloads(limit: int = 500):
     logger.info(f"Found {len(pending)} files to download")
 
     downloaded = 0
-    skipped = 0
+    missing = 0
+    skipped_dupe = 0
     errors = 0
 
     for i, entry in enumerate(pending):
@@ -179,20 +181,27 @@ def process_downloads(limit: int = 500):
 
         parsed = urlparse(url)
         filename = os.path.basename(parsed.path) or f"file_{i}.{file_type}"
-        filename = "".join(c for c in filename if c.isalnum() or c in ".-_ ").strip()
-        if not filename:
-            filename = f"file_{i}.{file_type}"
+        filename = "".join(c for c in filename if c.isalnum() or c in ".-_ ").strip() or f"file_{i}.{file_type}"
 
         temp_path = os.path.join(TEMP_DOWNLOAD_DIR, filename)
 
-        success, file_size, sha256 = download_file(url, temp_path)
-        if not success:
-            logger.error(f"  Failed to download: {url}")
+        result, file_size, sha256 = download_file(url, temp_path)
+
+        if result == "missing":
+            logger.info(f"  NOT_FOUND (404): {url}")
+            # IMPORTANT: don't keep retrying forever
+            mark_url_scraped(url, downloaded=True)  # treat as terminal; adjust if you add a 'missing' status column
+            missing += 1
+            continue
+
+        if result != "ok":
+            logger.error(f"  Failed to download: {url} (result={result})")
             errors += 1
             continue
 
         if document_exists(sha256_hash=sha256):
-            logger.debug(f"  SHA256 match but keeping unique EFTA file: {filename}")
+            skipped_dupe += 1
+            logger.debug(f"  Duplicate SHA256 (still storing unique filename): {filename}")
 
         ds_prefix = f"dataset_{dataset_id:02d}" if dataset_id else "other"
         s3_key = f"{ds_prefix}/{file_type}/{filename}"
@@ -204,10 +213,7 @@ def process_downloads(limit: int = 500):
             logger.error(f"  S3 upload failed: {e}")
             errors += 1
             if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
+                os.remove(temp_path)
             continue
 
         file_id = f"DS{dataset_id or 0}-{sha256[:8]}"
@@ -223,9 +229,7 @@ def process_downloads(limit: int = 500):
             "s3_key": s3_key,
             "s3_url": s3_url,
             "sha256_hash": sha256,
-          from datetime import timezone  # add at top with imports
-...
-"date_downloaded": datetime.now(timezone.utc).isoformat(),
+            "date_downloaded": datetime.now(timezone.utc).isoformat(),
             "source": "doj_efta",
             "status": "downloaded",
         })
@@ -233,25 +237,26 @@ def process_downloads(limit: int = 500):
         mark_url_scraped(url, downloaded=True)
 
         if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
+            os.remove(temp_path)
 
         downloaded += 1
         time.sleep(REQUEST_DELAY)
 
-    logger.info(f"\nDownload complete: {downloaded} downloaded, {skipped} skipped (dupes), {errors} errors")
-    return downloaded, skipped, errors
+    logger.info(
+        f"\nDownload complete: {downloaded} downloaded, {missing} missing(404), "
+        f"{skipped_dupe} dupes, {errors} errors"
+    )
+    return downloaded, missing, skipped_dupe, errors
 
 
 if __name__ == "__main__":
     init_db()
-    downloaded, skipped, errors = process_downloads()
+    downloaded, missing, dupes, errors = process_downloads()
 
     print(f"\n{'='*50}")
     print("Download Summary")
     print(f"{'='*50}")
     print(f"Downloaded:  {downloaded}")
-    print(f"Skipped:     {skipped} (duplicates)")
+    print(f"Missing:     {missing} (404)")
+    print(f"Duplicates:  {dupes} (sha256)")
     print(f"Errors:      {errors}")
