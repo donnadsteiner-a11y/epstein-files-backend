@@ -180,10 +180,10 @@ def process_downloads(limit: int = 500):
     errors = 0
 
     for i, entry in enumerate(pending):
-    url = entry["url"]
-    url = normalize_doj_url(url)
-    dataset_id = entry.get("dataset_id")
-    file_type = entry.get("file_type", "pdf")
+        url = entry["url"]
+        url = normalize_doj_url(url)
+        dataset_id = entry.get("dataset_id")
+        file_type = entry.get("file_type", "pdf")
 
         logger.info(f"[{i+1}/{len(pending)}] Downloading: {url}")
 
