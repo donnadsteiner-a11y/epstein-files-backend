@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 import re
+from collections import defaultdict
 
 import requests
 import boto3
@@ -38,9 +39,8 @@ from crawler.doj_session import build_doj_session, PDF_MAGIC  # noqa: E402
 # Tunables
 # =============================
 
-# How many sequential "true missing" (after relocation attempts) we tolerate
-# for the same (dataset + prefix) before bulk-marking the rest.
-# Keep this conservative to avoid false negatives.
+# How many "true missing" (after relocation attempts) we tolerate for the same
+# (dataset + prefix) before bulk-marking the rest.
 MISSING_STREAK_TRIGGER = 25
 
 # Prefix definition: drop last N digits from the numeric tail (usually 2 works well)
@@ -179,7 +179,8 @@ def _prefix_for_filename(filename: str) -> str:
     Example:
       EFTA00800101.pdf -> stem EFTA00800101 -> prefix EFTA008001 (drop last 2 digits)
     """
-    stem = filename[:-4] if filename.lower().endswith(".pdf") else filename
+    base = os.path.basename(filename)
+    stem = base[:-4] if base.lower().endswith(".pdf") else base
     if len(stem) <= NUMERIC_SUFFIX_DROP:
         return stem
     return stem[:-NUMERIC_SUFFIX_DROP]
@@ -232,9 +233,14 @@ def get_content_type(file_type: str) -> str:
 def bulk_mark_missing_by_prefix(dataset_id: int, prefix: str, reason: str) -> int:
     """
     Mark ALL pending scraped_urls matching this dataset+prefix pattern as missing.
-    This is the acceleration trick.
+
+    IMPORTANT: We intentionally match on URL (not dataset_id column) because dataset_id
+    in scraped_urls can be wrong until relocation corrects it.
     """
-    pattern = f"https://www.justice.gov/epstein/files/DataSet%20{dataset_id}/{prefix}%.pdf"
+    # Match URLs like:
+    # https://www.justice.gov/epstein/files/DataSet%20{dataset_id}/{prefix}*.pdf
+    pattern = f"https://www.justice.gov/epstein/files/DataSet%20{int(dataset_id)}/{prefix}%.pdf"
+
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -251,6 +257,7 @@ def bulk_mark_missing_by_prefix(dataset_id: int, prefix: str, reason: str) -> in
             )
             updated = cur.rowcount or 0
         conn.commit()
+
     return updated
 
 
@@ -378,11 +385,10 @@ def process_downloads(limit: int = 500):
     errors = 0
     bulk_skipped = 0
 
-    # 404 streak tracking
-    streak_key: tuple[int, str] | None = None  # (dataset_id, prefix)
-    streak_count = 0
-
-    # if we bulk-mark (dataset,prefix), skip further urls matching it during this run
+    # FIX: the old "streak" required misses to be adjacent in the queue.
+    # But your queue is mixed by dataset / filename, so it rarely triggers.
+    # We instead count misses per (dataset,prefix) across the run.
+    missing_counts: dict[tuple[int, str], int] = defaultdict(int)
     bulk_blocked: set[tuple[int, str]] = set()
 
     for i, entry in enumerate(pending):
@@ -426,45 +432,30 @@ def process_downloads(limit: int = 500):
             mark_url_scraped(original_url, downloaded=True, status="missing")
             missing += 1
 
-            # streak logic uses final_url (post-relocation) so we only bulk-mark when
-            # relocation ALSO failed repeatedly.
+            # Count "true missing" per (dataset,prefix) based on final_url
             ds_f, fn_f = _dataset_and_filename(final_url)
             if ds_f and fn_f:
                 prefix = _prefix_for_filename(fn_f)
                 key = (ds_f, prefix)
+                missing_counts[key] += 1
 
-                if streak_key == key:
-                    streak_count += 1
-                else:
-                    streak_key = key
-                    streak_count = 1
-
-                if streak_count >= MISSING_STREAK_TRIGGER and key not in bulk_blocked:
+                if missing_counts[key] >= MISSING_STREAK_TRIGGER and key not in bulk_blocked:
                     reason = f"bulk_missing_streak:{ds_f}:{prefix}"
                     try:
                         updated = bulk_mark_missing_by_prefix(ds_f, prefix, reason)
                         bulk_blocked.add(key)
                         logger.warning(
                             f"  BULK-MISSING triggered for DataSet {ds_f} prefix {prefix}% "
-                            f"(streak={streak_count}) updated_rows={updated}"
+                            f"(count={missing_counts[key]}) updated_rows={updated}"
                         )
                     except Exception as e:
                         logger.warning(f"  BULK-MISSING failed for {key}: {e}")
-                    finally:
-                        # reset streak after attempting bulk action
-                        streak_key = None
-                        streak_count = 0
 
             continue
-
-        # reset streak on any non-missing outcome
-        streak_key = None
-        streak_count = 0
 
         if result != "ok":
             logger.error(f"  Failed to download: {final_url} (result={result})")
             errors += 1
-            # optional: mark error
             try:
                 mark_url_scraped(original_url, downloaded=False, status="error", last_error=f"download_error:{result}")
             except Exception:
@@ -485,7 +476,7 @@ def process_downloads(limit: int = 500):
             logger.error(f"  S3 upload failed: {e}")
             errors += 1
             try:
-                mark_url_scraped(original_url, downloaded=False, status="error", last_error=f"s3_upload_failed:{e}")
+                mark_url_scraped(original_url, downloaded=False, status="error", last_error=f"s3_upload_failed:{type(e).__name__}")
             except Exception:
                 pass
             if os.path.exists(temp_path):
