@@ -15,16 +15,21 @@ import boto3
 from botocore.config import Config as BotoConfig
 
 import re
-
 def normalize_doj_url(url: str) -> str:
     """
-    DOJ sometimes lists files as /epstein/files/EFTAxxxxx.pdf
-    but the real file lives under /epstein/files/DataSet 10/.
+    Fix URLs that are missing the dataset path.
+    Only rewrite if the URL is:
+    /epstein/files/EFTAxxxx.pdf
+    and NOT already inside DataSet XX.
     """
+    if "/DataSet" in url:
+        return url
+
     m = re.match(r"https://www\.justice\.gov/epstein/files/(EFTA[^/]+\.pdf)", url)
     if m:
         filename = m.group(1)
         return f"https://www.justice.gov/epstein/files/DataSet%2010/{filename}"
+
     return url
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
