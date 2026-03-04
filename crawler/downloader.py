@@ -223,7 +223,9 @@ def process_downloads(limit: int = 500):
             "s3_key": s3_key,
             "s3_url": s3_url,
             "sha256_hash": sha256,
-            "date_downloaded": datetime.utcnow().isoformat(),
+          from datetime import timezone  # add at top with imports
+...
+"date_downloaded": datetime.now(timezone.utc).isoformat(),
             "source": "doj_efta",
             "status": "downloaded",
         })
