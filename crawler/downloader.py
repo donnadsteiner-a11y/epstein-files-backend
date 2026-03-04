@@ -9,60 +9,11 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+import re
 
 import requests
 import boto3
 from botocore.config import Config as BotoConfig
-
-import re
-def normalize_doj_url(url: str) -> str:
-    """
-    Fix URLs that are missing the dataset path.
-    Only rewrite if the URL is:
-    /epstein/files/EFTAxxxx.pdf
-    and NOT already inside DataSet XX.
-    """
-    if "/DataSet" in url:
-        return url
-
-    import urllib.parse
-
-def relocate_dataset_pdf(url: str) -> str | None:
-    """
-    If url is .../DataSet XX/EFTA....pdf and returns 404,
-    try nearby datasets to find where the file actually lives.
-    Returns the working URL or None.
-    """
-    m = re.match(r"^https://www\.justice\.gov/epstein/files/DataSet%20(\d+)/((?:EFTA|EFTR)[^/]+\.pdf)$", url)
-    if not m:
-        return None
-
-    ds = int(m.group(1))
-    fn = m.group(2)
-
-    # try current, then neighbors (tune range if needed)
-    candidates = [ds] + [d for k in range(1, 6) for d in (ds - k, ds + k) if 1 <= d <= 99]
-
-    for d in candidates:
-        test_url = f"https://www.justice.gov/epstein/files/DataSet%20{d}/{fn}"
-        try:
-            r = session.get(test_url, stream=True, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-            ct = (r.headers.get("Content-Type") or "").lower()
-
-            # only accept a real pdf
-            if r.status_code == 200 and "application/pdf" in ct:
-                return test_url
-        except requests.RequestException:
-            continue
-
-    return None
-
-    m = re.match(r"https://www\.justice\.gov/epstein/files/(EFTA[^/]+\.pdf)", url)
-    if m:
-        filename = m.group(1)
-        return f"https://www.justice.gov/epstein/files/DataSet%2010/{filename}"
-
-    return url
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -89,10 +40,116 @@ logging.basicConfig(
 )
 logger = logging.getLogger("downloader")
 
-# Use DOJ-hardened session (should include browser-like headers + cookies priming)
+# Use DOJ-hardened session (browser-like headers + cookies priming)
 session = build_doj_session()
 session.headers.update({"User-Agent": USER_AGENT})
 
+
+# -----------------------------
+# DOJ URL normalization + relocation
+# -----------------------------
+
+_DOJ_DATASET_RE = re.compile(
+    r"^https://www\.justice\.gov/epstein/files/DataSet%20(\d+)/((?:EFTA|EFTR)[^/]+\.pdf)$"
+)
+_DOJ_BARE_RE = re.compile(
+    r"^https://www\.justice\.gov/epstein/files/((?:EFTA|EFTR)[^/]+\.pdf)$"
+)
+
+def normalize_doj_url(url: str, dataset_id: int | None = None) -> str:
+    """
+    If URL is a bare DOJ epstein file URL (no DataSet path) and we have dataset_id,
+    rewrite to DataSet%20{dataset_id}/filename.pdf.
+
+    If dataset_id is unknown, leave as-is (we may relocate by probing later).
+    """
+    if "/DataSet%20" in url:
+        return url
+
+    m = _DOJ_BARE_RE.match(url)
+    if m and dataset_id:
+        fn = m.group(1)
+        return f"https://www.justice.gov/epstein/files/DataSet%20{int(dataset_id)}/{fn}"
+
+    return url
+
+
+def _probe_pdf_head(url: str) -> bool:
+    """
+    Lightweight check: request stream and verify:
+      - HTTP 200
+      - Content-Type includes application/pdf
+      - First bytes match PDF magic
+    """
+    try:
+        r = session.get(url, stream=True, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        ct = (r.headers.get("Content-Type") or "").lower()
+
+        if r.status_code != 200:
+            r.close()
+            return False
+
+        if "application/pdf" not in ct:
+            # Often DOJ gate pages come back as HTML
+            r.close()
+            return False
+
+        magic = r.raw.read(len(PDF_MAGIC))
+        r.close()
+        return magic == PDF_MAGIC
+    except requests.RequestException:
+        return False
+
+
+def relocate_dataset_pdf(url: str, max_offset: int = 6, max_dataset: int = 99) -> str | None:
+    """
+    If url is .../DataSet XX/EFTA....pdf and returns 404 (or bad content),
+    try nearby datasets to find where the file actually lives.
+    Returns the working URL or None.
+
+    We probe: ds, ds-1, ds+1, ds-2, ds+2, ... up to max_offset.
+    """
+    m = _DOJ_DATASET_RE.match(url)
+    if not m:
+        return None
+
+    ds = int(m.group(1))
+    fn = m.group(2)
+
+    candidates: list[int] = [ds]
+    for k in range(1, max_offset + 1):
+        for d in (ds - k, ds + k):
+            if 1 <= d <= max_dataset:
+                candidates.append(d)
+
+    for d in candidates:
+        test_url = f"https://www.justice.gov/epstein/files/DataSet%20{d}/{fn}"
+        if _probe_pdf_head(test_url):
+            return test_url
+
+    return None
+
+
+def locate_dataset_for_bare_url(url: str, max_dataset: int = 99) -> str | None:
+    """
+    If url is https://www.justice.gov/epstein/files/EFTAxxxx.pdf (no dataset),
+    try datasets 1..max_dataset and return the first that serves a real PDF.
+    """
+    m = _DOJ_BARE_RE.match(url)
+    if not m:
+        return None
+
+    fn = m.group(1)
+    for d in range(1, max_dataset + 1):
+        test_url = f"https://www.justice.gov/epstein/files/DataSet%20{d}/{fn}"
+        if _probe_pdf_head(test_url):
+            return test_url
+    return None
+
+
+# -----------------------------
+# S3 helpers
+# -----------------------------
 
 def get_s3_client():
     return boto3.client(
@@ -129,45 +186,78 @@ def get_content_type(file_type: str) -> str:
     }
     return types.get(file_type, "application/octet-stream")
 
-def download_file(url: str, dest_path: str) -> tuple[str, int, str]:
+
+# -----------------------------
+# Download + verify
+# -----------------------------
+
+def download_file(url: str, dest_path: str) -> tuple[str, int, str, str]:
     """
     Download a DOJ file and verify it is a real PDF.
 
     Returns:
-        ("ok", size, sha256)
-        ("missing", 0, "")
-        ("error", 0, "")
+        ("ok", size, sha256, final_url)
+        ("missing", 0, "", final_url)
+        ("error", 0, "", final_url)
     """
+    final_url = url
 
     for attempt in range(MAX_RETRIES):
         try:
             resp = session.get(
-                url,
+                final_url,
                 stream=True,
                 timeout=REQUEST_TIMEOUT,
                 allow_redirects=True,
             )
 
+            # Handle 404 with relocation if possible
             if resp.status_code == 404:
-                return "missing", 0, ""
+                resp.close()
+
+                relocated = relocate_dataset_pdf(final_url)
+                if relocated:
+                    logger.info(f"  Relocated dataset URL: {final_url} -> {relocated}")
+                    final_url = relocated
+                    continue
+
+                # If it was a bare URL, try locating dataset
+                bare_loc = locate_dataset_for_bare_url(final_url)
+                if bare_loc:
+                    logger.info(f"  Located dataset for bare URL: {final_url} -> {bare_loc}")
+                    final_url = bare_loc
+                    continue
+
+                return "missing", 0, "", final_url
 
             ct = (resp.headers.get("Content-Type") or "").lower()
-
             if "text/html" in ct:
-                raise requests.RequestException(
-                    f"HTML response status={resp.status_code} ct={ct}"
-                )
+                resp.close()
+                # Gate page or error page; attempt relocation if dataset-structured
+                relocated = relocate_dataset_pdf(final_url)
+                if relocated and relocated != final_url:
+                    logger.info(f"  HTML response; relocating: {final_url} -> {relocated}")
+                    final_url = relocated
+                    continue
+                raise requests.RequestException(f"HTML response status={resp.status_code} ct={ct}")
 
             resp.raise_for_status()
 
             sha256 = hashlib.sha256()
             total_size = 0
 
+            # Verify magic bytes first
             magic = resp.raw.read(len(PDF_MAGIC))
-
             if magic != PDF_MAGIC:
+                resp.close()
+                # Not a PDF. Try relocation if possible.
+                relocated = relocate_dataset_pdf(final_url)
+                if relocated and relocated != final_url:
+                    logger.info(f"  NOT_PDF; relocating: {final_url} -> {relocated}")
+                    final_url = relocated
+                    continue
                 raise requests.RequestException(
-                    f"NOT_PDF magic={magic!r} status={resp.status_code}"
+                    f"NOT_PDF magic={magic!r} status={resp.status_code} ct={ct}"
                 )
 
             with open(dest_path, "wb") as f:
@@ -181,10 +271,11 @@ def download_file(url: str, dest_path: str) -> tuple[str, int, str]:
                         sha256.update(chunk)
                         total_size += len(chunk)
 
-            return "ok", total_size, sha256.hexdigest()
+            resp.close()
+            return "ok", total_size, sha256.hexdigest(), final_url
 
         except requests.RequestException as e:
-            logger.warning(f"Download attempt {attempt+1} failed for {url}: {e}")
+            logger.warning(f"Download attempt {attempt+1} failed for {final_url}: {e}")
             time.sleep(REQUEST_DELAY * (attempt + 1))
 
             if os.path.exists(dest_path):
@@ -193,6 +284,7 @@ def download_file(url: str, dest_path: str) -> tuple[str, int, str]:
                 except Exception:
                     pass
 
+    return "error", 0, "", final_url
 
 
 def upload_to_s3(s3, local_path: str, s3_key: str, content_type: str | None = None) -> str:
@@ -203,6 +295,10 @@ def upload_to_s3(s3, local_path: str, s3_key: str, content_type: str | None = No
     s3.upload_file(local_path, S3_BUCKET, s3_key, ExtraArgs=extra_args)
     return f"{S3_PUBLIC_URL}/{s3_key}"
 
+
+# -----------------------------
+# Main processing loop
+# -----------------------------
 
 def process_downloads(limit: int = 500):
     s3 = get_s3_client()
@@ -217,10 +313,11 @@ def process_downloads(limit: int = 500):
     errors = 0
 
     for i, entry in enumerate(pending):
-        url = entry["url"]
-        url = normalize_doj_url(url)
+        original_url = entry["url"]
         dataset_id = entry.get("dataset_id")
         file_type = entry.get("file_type", "pdf")
+
+        url = normalize_doj_url(original_url, dataset_id)
 
         logger.info(f"[{i+1}/{len(pending)}] Downloading: {url}")
 
@@ -230,17 +327,16 @@ def process_downloads(limit: int = 500):
 
         temp_path = os.path.join(TEMP_DOWNLOAD_DIR, filename)
 
-        result, file_size, sha256 = download_file(url, temp_path)
+        result, file_size, sha256, final_url = download_file(url, temp_path)
 
         if result == "missing":
-            logger.info(f"  NOT_FOUND (404): {url}")
-            # IMPORTANT: don't keep retrying forever
-            mark_url_scraped(url, downloaded=True)  # treat as terminal; adjust if you add a 'missing' status column
+            logger.info(f"  NOT_FOUND (404): {final_url}")
+            mark_url_scraped(original_url, downloaded=True)  # terminal
             missing += 1
             continue
 
         if result != "ok":
-            logger.error(f"  Failed to download: {url} (result={result})")
+            logger.error(f"  Failed to download: {final_url} (result={result})")
             errors += 1
             continue
 
@@ -270,7 +366,7 @@ def process_downloads(limit: int = 500):
             "file_type": file_type,
             "file_size": file_size,
             "dataset_id": dataset_id,
-            "source_url": url,
+            "source_url": final_url,      # store the URL that actually worked
             "s3_key": s3_key,
             "s3_url": s3_url,
             "sha256_hash": sha256,
@@ -279,7 +375,8 @@ def process_downloads(limit: int = 500):
             "status": "downloaded",
         })
 
-        mark_url_scraped(url, downloaded=True)
+        # Mark the original scraped URL as done so we don't requeue it forever.
+        mark_url_scraped(original_url, downloaded=True)
 
         if os.path.exists(temp_path):
             os.remove(temp_path)
