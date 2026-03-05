@@ -20,12 +20,12 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 import re
 from collections import defaultdict
+import subprocess
 
 import requests
 import boto3
 from botocore.config import Config as BotoConfig
 import psycopg
-import fitz  # PyMuPDF
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -39,7 +39,6 @@ from db.database import (  # noqa: E402
     init_db, get_undownloaded_urls, mark_url_scraped,
     insert_document, document_exists, update_scraped_dataset_id
 )
-
 from crawler.doj_session import build_doj_session, PDF_MAGIC  # noqa: E402
 
 
@@ -59,6 +58,9 @@ BLOCK_SIG_PHRASES = (
 )
 SNIFF_CHARS = 2500  # how much to sniff from first page text
 
+# Warmup URL: any stable PDF path (use one you know exists)
+DOJ_WARMUP_URL = "https://www.justice.gov/epstein/files/DataSet%2010/EFTA01602154.pdf"
+
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
@@ -71,10 +73,43 @@ logging.basicConfig(
 logger = logging.getLogger("downloader")
 
 
+# -----------------------------
+# DOJ session helpers
+# -----------------------------
+def _set_age_cookie(s: requests.Session) -> None:
+    """
+    Force the age cookie that your shell test shows.
+    Requests sometimes won’t persist it across certain redirects unless set explicitly.
+    """
+    try:
+        # Try both host and dot-domain; harmless if redundant
+        s.cookies.set("justiceGovAgeVerified", "true", domain="www.justice.gov", path="/")
+        s.cookies.set("justiceGovAgeVerified", "true", domain=".justice.gov", path="/")
+    except Exception:
+        pass
+
+
+def _warmup_queueit(s: requests.Session) -> None:
+    """
+    Warm up QueueIT cookie (QueueITAccepted-...).
+    Your shell test showed DOJ responds with Set-Cookie for QueueITAccepted on a PDF GET.
+    """
+    try:
+        r = s.get(DOJ_WARMUP_URL, timeout=REQUEST_TIMEOUT, allow_redirects=True, stream=True)
+        # Drain a tiny bit if it’s a PDF, then close
+        _ = r.raw.read(8) if hasattr(r, "raw") else None
+        r.close()
+    except Exception:
+        pass
+
+
 def new_session() -> requests.Session:
-    """Create a DOJ-hardened session (cookies primed, browser-ish)."""
+    """Create a DOJ-hardened session (cookies primed, browser-ish) + warmup."""
     s = build_doj_session()
-    s.headers.update({"User-Agent": USER_AGENT})
+    if USER_AGENT:
+        s.headers.update({"User-Agent": USER_AGENT})
+    _set_age_cookie(s)
+    _warmup_queueit(s)
     return s
 
 
@@ -108,6 +143,7 @@ def _is_age_verify(resp: requests.Response) -> bool:
     if resp.url and "/age-verify" in resp.url:
         return True
     ct = (resp.headers.get("Content-Type") or "").lower()
+    # Only treat HTML as a gate if it’s not a PDF
     if "text/html" in ct:
         return True
     return False
@@ -196,12 +232,9 @@ def reconcile_scraped_url(original_url: str, final_url: str, dataset_id: int | N
     """
     Ensure mark_url_scraped() can find the right row even if final_url differs.
 
-    Strategy:
-    - If final_url == original_url: nothing to do.
-    - Else try to UPDATE scraped_urls.url = final_url WHERE url = original_url
-      BUT only if final_url doesn't already exist (avoid PK/unique collision).
-    - If collision, keep original_url and stash the resolved URL in last_error.
-    Returns the URL you should pass to mark_url_scraped() (either final_url or original_url).
+    Returns the URL that should be used as the key when calling mark_url_scraped():
+      - final_url if we successfully updated scraped_urls.url to final_url
+      - otherwise original_url
     """
     if final_url == original_url:
         return original_url
@@ -255,7 +288,7 @@ def reconcile_scraped_url(original_url: str, final_url: str, dataset_id: int | N
 def upsert_document_by_filename(doc: dict) -> None:
     """
     Prefer updating an existing documents row by filename (especially for needs_redownload),
-    instead of creating duplicates via insert_document().
+    instead of creating duplicates.
     """
     try:
         with psycopg.connect(DATABASE_URL) as conn:
@@ -312,10 +345,7 @@ def upsert_document_by_filename(doc: dict) -> None:
                     conn.commit()
                     return
     except Exception as e:
-        logger.warning(
-            f"  upsert_document_by_filename UPDATE failed, falling back to insert_document(): "
-            f"{type(e).__name__}: {e}"
-        )
+        logger.warning(f"  upsert_document_by_filename UPDATE failed, fallback to insert_document(): {type(e).__name__}: {e}")
 
     insert_document(doc)
 
@@ -395,14 +425,15 @@ def _sniff_first_page_text_is_block_pdf(pdf_path: str) -> bool:
     """
     Extract first page text and look for the block signature.
     Require >=2 phrase hits to reduce false positives.
-    Uses PyMuPDF (works on Render without OS packages).
     """
     try:
-        with fitz.open(pdf_path) as doc:
-            if doc.page_count < 1:
-                return False
-            page = doc.load_page(0)
-            txt = page.get_text("text") or ""
+        proc = subprocess.run(
+            ["pdftotext", "-f", "1", "-l", "1", "-layout", pdf_path, "-"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        txt = (proc.stdout or b"").decode("utf-8", errors="replace")
         head = txt[:SNIFF_CHARS]
         hits = sum(1 for p in BLOCK_SIG_PHRASES if p in head)
         return hits >= 2
@@ -431,13 +462,14 @@ def download_file(url: str, dest_path: str) -> tuple[str, int, str, str, str]:
                 note = f"age_verify:{resp.url}"
                 resp.close()
 
-                logger.warning(f"Age-verify gate hit. Re-priming session. attempt={attempt+1}")
+                # rebuild + warmup once, retry once, then stop burning retries
+                logger.warning("Age-verify gate hit. Rebuilding session + warmup.")
                 session = new_session()
-                time.sleep(REQUEST_DELAY * (attempt + 1))
+                time.sleep(REQUEST_DELAY)
 
-                if attempt == MAX_RETRIES - 1:
-                    return "age_verify", 0, "", resp.url or final_url, note
-                continue
+                if attempt == 0:
+                    continue
+                return "age_verify", 0, "", resp.url or final_url, note
 
             # 404 relocation logic
             if resp.status_code == 404:
@@ -566,17 +598,18 @@ def process_downloads(limit: int = 500):
 
         result, file_size, sha256, final_url, note = download_file(url, temp_path)
 
-        # If relocated to another dataset, correct dataset_id
-        m = _DOJ_DATASET_RE.match(final_url)
-        if m:
-            final_ds = int(m.group(1))
-            if dataset_id != final_ds:
-                logger.info(f"  Dataset corrected: {dataset_id} -> {final_ds}")
-                dataset_id = final_ds
-                try:
-                    update_scraped_dataset_id(original_url, final_ds)
-                except Exception as e:
-                    logger.warning(f"  Could not update scraped_urls.dataset_id for {original_url}: {e}")
+        # Only trust relocation dataset changes if we actually got a PDF file (ok or blocked_pdf).
+        if result in ("ok", "blocked_pdf"):
+            m = _DOJ_DATASET_RE.match(final_url)
+            if m:
+                final_ds = int(m.group(1))
+                if dataset_id != final_ds:
+                    logger.info(f"  Dataset corrected: {dataset_id} -> {final_ds}")
+                    dataset_id = final_ds
+                    try:
+                        update_scraped_dataset_id(original_url, final_ds)
+                    except Exception as e:
+                        logger.warning(f"  Could not update scraped_urls.dataset_id for {original_url}: {e}")
 
         # Ensure we can update the right scraped_urls row even if URL changed
         url_for_mark = reconcile_scraped_url(original_url, final_url, dataset_id, file_type)
@@ -589,7 +622,7 @@ def process_downloads(limit: int = 500):
                 file_type=file_type,
                 downloaded=True,
                 status="missing",
-                last_error=f"{note}|orig:{original_url}|final:{final_url}",
+                last_error=note,
             )
             missing += 1
 
@@ -627,7 +660,7 @@ def process_downloads(limit: int = 500):
                 file_type=file_type,
                 downloaded=False,
                 status="age_verify",
-                last_error=f"{note}|orig:{original_url}|final:{final_url}",
+                last_error=note,
             )
             if os.path.exists(temp_path):
                 try:
@@ -645,7 +678,7 @@ def process_downloads(limit: int = 500):
                 file_type=file_type,
                 downloaded=False,
                 status="blocked_pdf",
-                last_error=f"{note}|orig:{original_url}|final:{final_url}",
+                last_error=note,
             )
             if os.path.exists(temp_path):
                 try:
@@ -663,7 +696,7 @@ def process_downloads(limit: int = 500):
                 file_type=file_type,
                 downloaded=False,
                 status="error",
-                last_error=f"download_error:{note}|orig:{original_url}|final:{final_url}",
+                last_error=f"download_error:{note}",
             )
             if os.path.exists(temp_path):
                 try:
@@ -692,7 +725,7 @@ def process_downloads(limit: int = 500):
                 file_type=file_type,
                 downloaded=False,
                 status="error",
-                last_error=f"s3_upload_failed:{type(e).__name__}|orig:{original_url}|final:{final_url}",
+                last_error=f"s3_upload_failed:{type(e).__name__}",
             )
             if os.path.exists(temp_path):
                 try:
@@ -710,7 +743,7 @@ def process_downloads(limit: int = 500):
             "file_type": file_type,
             "file_size": file_size,
             "dataset_id": dataset_id,
-            "source_url": final_url,  # the URL that actually served the PDF
+            "source_url": final_url,
             "s3_key": s3_key,
             "s3_url": s3_url,
             "sha256_hash": sha256,
@@ -719,7 +752,6 @@ def process_downloads(limit: int = 500):
             "status": "downloaded",
         }
 
-        # Upsert by filename to avoid duplicates when re-downloading
         upsert_document_by_filename(doc)
 
         mark_url_scraped(
