@@ -6,6 +6,10 @@ Protections added:
 - Detect DOJ age-verify redirects (/age-verify) and treat as NOT a PDF.
 - Detect "block/WAF PDFs" (real %PDF but contains "Product ID / Source IP ...") and do NOT ingest.
 - Only upload + insert documents when content is a real target PDF.
+
+Data integrity fixes:
+- If DOJ relocation changes the URL, reconcile scraped_urls.url safely (avoid key collisions).
+- Upsert documents by filename when re-downloading (avoid duplicates, keep continuity).
 """
 import os
 import sys
@@ -186,6 +190,139 @@ def _prefix_for_filename(filename: str) -> str:
 
 
 # -----------------------------
+# DB helpers (safe URL reconcile + document upsert)
+# -----------------------------
+def reconcile_scraped_url(original_url: str, final_url: str, dataset_id: int | None, file_type: str | None) -> str:
+    """
+    Ensure mark_url_scraped() can find the right row even if final_url differs.
+
+    Strategy:
+    - If final_url == original_url: nothing to do.
+    - Else try to UPDATE scraped_urls.url = final_url WHERE url = original_url
+      BUT only if final_url doesn't already exist (avoid PK/unique collision).
+    - If collision, keep original_url and stash the resolved URL in last_error.
+    Returns the URL you should pass to mark_url_scraped() (either final_url or original_url).
+    """
+    if final_url == original_url:
+        return original_url
+
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM public.scraped_urls WHERE url=%s LIMIT 1", (final_url,))
+                exists = cur.fetchone() is not None
+
+                if not exists:
+                    cur.execute(
+                        """
+                        UPDATE public.scraped_urls
+                        SET url=%s,
+                            dataset_id=COALESCE(%s, dataset_id),
+                            file_type=COALESCE(%s, file_type),
+                            last_checked=NOW(),
+                            last_error=COALESCE(last_error,'') || %s
+                        WHERE url=%s
+                        """,
+                        (
+                            final_url,
+                            dataset_id,
+                            file_type,
+                            f"|relocated_from:{original_url}",
+                            original_url,
+                        ),
+                    )
+                    conn.commit()
+                    if (cur.rowcount or 0) > 0:
+                        return final_url
+
+                # collision path: keep original, but record resolved in last_error
+                cur.execute(
+                    """
+                    UPDATE public.scraped_urls
+                    SET last_checked=NOW(),
+                        last_error=COALESCE(last_error,'') || %s
+                    WHERE url=%s
+                    """,
+                    (f"|resolved_to:{final_url}", original_url),
+                )
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"  reconcile_scraped_url failed: {type(e).__name__}: {e}")
+
+    return original_url
+
+
+def upsert_document_by_filename(doc: dict) -> None:
+    """
+    Prefer updating an existing documents row by filename (especially for needs_redownload),
+    instead of creating duplicates via insert_document().
+
+    This assumes public.documents has a unique or at least stable filename per file.
+    If you do NOT have a unique constraint, the UPDATE still works and affects the latest match.
+    """
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                # Update if exists (any status), else insert via insert_document()
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM public.documents
+                    WHERE filename=%s
+                    ORDER BY updated_at DESC NULLS LAST, id DESC
+                    LIMIT 1
+                    """,
+                    (doc["filename"],),
+                )
+                row = cur.fetchone()
+                if row:
+                    doc_id = row[0]
+                    cur.execute(
+                        """
+                        UPDATE public.documents
+                        SET
+                            file_id=%s,
+                            title=%s,
+                            file_type=%s,
+                            file_size=%s,
+                            dataset_id=%s,
+                            source_url=%s,
+                            s3_key=%s,
+                            s3_url=%s,
+                            sha256_hash=%s,
+                            date_downloaded=%s,
+                            source=%s,
+                            status=%s,
+                            extracted_text=NULL,
+                            updated_at=NOW()
+                        WHERE id=%s
+                        """,
+                        (
+                            doc.get("file_id"),
+                            doc.get("title"),
+                            doc.get("file_type"),
+                            doc.get("file_size"),
+                            doc.get("dataset_id"),
+                            doc.get("source_url"),
+                            doc.get("s3_key"),
+                            doc.get("s3_url"),
+                            doc.get("sha256_hash"),
+                            doc.get("date_downloaded"),
+                            doc.get("source"),
+                            doc.get("status"),
+                            doc_id,
+                        ),
+                    )
+                    conn.commit()
+                    return
+    except Exception as e:
+        logger.warning(f"  upsert_document_by_filename UPDATE failed, will fallback to insert_document(): {type(e).__name__}: {e}")
+
+    # Fallback
+    insert_document(doc)
+
+
+# -----------------------------
 # S3 helpers
 # -----------------------------
 def get_s3_client():
@@ -238,7 +375,7 @@ def bulk_mark_missing_by_prefix(dataset_id: int, prefix: str, reason: str) -> in
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE scraped_urls
+                UPDATE public.scraped_urls
                 SET status='missing',
                     downloaded=1,
                     last_checked=NOW(),
@@ -445,10 +582,13 @@ def process_downloads(limit: int = 500):
                 except Exception as e:
                     logger.warning(f"  Could not update scraped_urls.dataset_id for {original_url}: {e}")
 
+        # Ensure we can update the right scraped_urls row even if URL changed
+        url_for_mark = reconcile_scraped_url(original_url, final_url, dataset_id, file_type)
+
         if result == "missing":
             logger.info(f"  NOT_FOUND (404): {final_url}")
             mark_url_scraped(
-                original_url,
+                url_for_mark,
                 dataset_id=dataset_id,
                 file_type=file_type,
                 downloaded=True,
@@ -486,7 +626,7 @@ def process_downloads(limit: int = 500):
             logger.warning(f"  AGE_VERIFY gate: {final_url}")
             age_gated += 1
             mark_url_scraped(
-                original_url,
+                url_for_mark,
                 dataset_id=dataset_id,
                 file_type=file_type,
                 downloaded=False,
@@ -504,7 +644,7 @@ def process_downloads(limit: int = 500):
             logger.warning(f"  BLOCKED_PDF detected (not ingesting): {final_url}")
             blocked += 1
             mark_url_scraped(
-                original_url,
+                url_for_mark,
                 dataset_id=dataset_id,
                 file_type=file_type,
                 downloaded=False,
@@ -522,7 +662,7 @@ def process_downloads(limit: int = 500):
             logger.error(f"  Failed to download: {final_url} (result={result})")
             errors += 1
             mark_url_scraped(
-                original_url,
+                url_for_mark,
                 dataset_id=dataset_id,
                 file_type=file_type,
                 downloaded=False,
@@ -539,7 +679,7 @@ def process_downloads(limit: int = 500):
         # OK PDF only from here
         if document_exists(sha256_hash=sha256):
             skipped_dupe += 1
-            logger.debug(f"  Duplicate SHA256 (still storing unique filename): {filename}")
+            logger.debug(f"  Duplicate SHA256: {filename}")
 
         ds_prefix = f"dataset_{dataset_id:02d}" if dataset_id else "other"
         s3_key = f"{ds_prefix}/{file_type}/{filename}"
@@ -551,7 +691,7 @@ def process_downloads(limit: int = 500):
             logger.error(f"  S3 upload failed: {e}")
             errors += 1
             mark_url_scraped(
-                original_url,
+                url_for_mark,
                 dataset_id=dataset_id,
                 file_type=file_type,
                 downloaded=False,
@@ -567,7 +707,7 @@ def process_downloads(limit: int = 500):
 
         file_id = f"DS{dataset_id or 0}-{sha256[:8]}"
 
-        insert_document({
+        doc = {
             "file_id": file_id,
             "filename": filename,
             "title": filename.rsplit(".", 1)[0].replace("_", " ").replace("-", " "),
@@ -581,10 +721,13 @@ def process_downloads(limit: int = 500):
             "date_downloaded": datetime.now(timezone.utc).isoformat(),
             "source": "doj_efta",
             "status": "downloaded",
-        })
+        }
+
+        # NEW: upsert by filename to avoid duplicate rows when re-downloading
+        upsert_document_by_filename(doc)
 
         mark_url_scraped(
-            original_url,
+            url_for_mark,
             dataset_id=dataset_id,
             file_type=file_type,
             downloaded=True,
