@@ -20,12 +20,12 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 import re
 from collections import defaultdict
-import subprocess
 
 import requests
 import boto3
 from botocore.config import Config as BotoConfig
 import psycopg
+import fitz  # PyMuPDF
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -256,14 +256,10 @@ def upsert_document_by_filename(doc: dict) -> None:
     """
     Prefer updating an existing documents row by filename (especially for needs_redownload),
     instead of creating duplicates via insert_document().
-
-    This assumes public.documents has a unique or at least stable filename per file.
-    If you do NOT have a unique constraint, the UPDATE still works and affects the latest match.
     """
     try:
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
-                # Update if exists (any status), else insert via insert_document()
                 cur.execute(
                     """
                     SELECT id
@@ -316,9 +312,11 @@ def upsert_document_by_filename(doc: dict) -> None:
                     conn.commit()
                     return
     except Exception as e:
-        logger.warning(f"  upsert_document_by_filename UPDATE failed, will fallback to insert_document(): {type(e).__name__}: {e}")
+        logger.warning(
+            f"  upsert_document_by_filename UPDATE failed, falling back to insert_document(): "
+            f"{type(e).__name__}: {e}"
+        )
 
-    # Fallback
     insert_document(doc)
 
 
@@ -397,15 +395,14 @@ def _sniff_first_page_text_is_block_pdf(pdf_path: str) -> bool:
     """
     Extract first page text and look for the block signature.
     Require >=2 phrase hits to reduce false positives.
+    Uses PyMuPDF (works on Render without OS packages).
     """
     try:
-        proc = subprocess.run(
-            ["pdftotext", "-f", "1", "-l", "1", "-layout", pdf_path, "-"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        txt = (proc.stdout or b"").decode("utf-8", errors="replace")
+        with fitz.open(pdf_path) as doc:
+            if doc.page_count < 1:
+                return False
+            page = doc.load_page(0)
+            txt = page.get_text("text") or ""
         head = txt[:SNIFF_CHARS]
         hits = sum(1 for p in BLOCK_SIG_PHRASES if p in head)
         return hits >= 2
@@ -434,7 +431,6 @@ def download_file(url: str, dest_path: str) -> tuple[str, int, str, str, str]:
                 note = f"age_verify:{resp.url}"
                 resp.close()
 
-                # rebuild session and retry
                 logger.warning(f"Age-verify gate hit. Re-priming session. attempt={attempt+1}")
                 session = new_session()
                 time.sleep(REQUEST_DELAY * (attempt + 1))
@@ -593,7 +589,7 @@ def process_downloads(limit: int = 500):
                 file_type=file_type,
                 downloaded=True,
                 status="missing",
-                last_error=note,
+                last_error=f"{note}|orig:{original_url}|final:{final_url}",
             )
             missing += 1
 
@@ -631,7 +627,7 @@ def process_downloads(limit: int = 500):
                 file_type=file_type,
                 downloaded=False,
                 status="age_verify",
-                last_error=note,
+                last_error=f"{note}|orig:{original_url}|final:{final_url}",
             )
             if os.path.exists(temp_path):
                 try:
@@ -649,7 +645,7 @@ def process_downloads(limit: int = 500):
                 file_type=file_type,
                 downloaded=False,
                 status="blocked_pdf",
-                last_error=note,
+                last_error=f"{note}|orig:{original_url}|final:{final_url}",
             )
             if os.path.exists(temp_path):
                 try:
@@ -667,7 +663,7 @@ def process_downloads(limit: int = 500):
                 file_type=file_type,
                 downloaded=False,
                 status="error",
-                last_error=f"download_error:{note}",
+                last_error=f"download_error:{note}|orig:{original_url}|final:{final_url}",
             )
             if os.path.exists(temp_path):
                 try:
@@ -696,7 +692,7 @@ def process_downloads(limit: int = 500):
                 file_type=file_type,
                 downloaded=False,
                 status="error",
-                last_error=f"s3_upload_failed:{type(e).__name__}",
+                last_error=f"s3_upload_failed:{type(e).__name__}|orig:{original_url}|final:{final_url}",
             )
             if os.path.exists(temp_path):
                 try:
@@ -723,7 +719,7 @@ def process_downloads(limit: int = 500):
             "status": "downloaded",
         }
 
-        # NEW: upsert by filename to avoid duplicate rows when re-downloading
+        # Upsert by filename to avoid duplicates when re-downloading
         upsert_document_by_filename(doc)
 
         mark_url_scraped(
