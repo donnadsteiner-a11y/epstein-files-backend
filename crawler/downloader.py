@@ -1,6 +1,11 @@
 """
 Downloader — Downloads scraped file URLs from the DOJ and uploads
 them to DreamObjects (S3-compatible cloud storage).
+
+Key protections:
+- Detect DOJ age-verify redirects (HTML) and treat as NOT a PDF.
+- Detect "blocked/WAF PDFs" (real %PDF but contains "Product ID / Source IP ...") and do NOT ingest.
+- Only upload + insert documents when content is a real target PDF.
 """
 import os
 import sys
@@ -11,11 +16,12 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 import re
 from collections import defaultdict
+import subprocess
+import tempfile
 
 import requests
 import boto3
 from botocore.config import Config as BotoConfig
-
 import psycopg
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,7 +37,7 @@ from db.database import (  # noqa: E402
     insert_document, document_exists, update_scraped_dataset_id
 )
 
-# DOJ session helpers (age gate + QueueIT priming + PDF checks)
+# DOJ session helpers (age gate + priming + PDF checks)
 from crawler.doj_session import build_doj_session, PDF_MAGIC  # noqa: E402
 
 
@@ -39,13 +45,20 @@ from crawler.doj_session import build_doj_session, PDF_MAGIC  # noqa: E402
 # Tunables
 # =============================
 
-# How many "true missing" (after relocation attempts) we tolerate for the same
-# (dataset + prefix) before bulk-marking the rest.
 MISSING_STREAK_TRIGGER = 25
-
-# Prefix definition: drop last N digits from the numeric tail (usually 2 works well)
-# E.g. EFTA00800101 -> prefix EFTA008001
 NUMERIC_SUFFIX_DROP = 2
+
+# Block-PDF signature (these appear in your extracted_text for bad PDFs)
+BLOCK_SIG_PHRASES = (
+    "Product ID:",
+    "Source IP:",
+    "Source Country:",
+    "Source Region:",
+    "Type: PRTT/CCC/17/",
+)
+
+# How many characters to sniff from first-page extraction
+SNIFF_CHARS = 2500
 
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -58,9 +71,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("downloader")
 
-# Use DOJ-hardened session (browser-like headers + cookies priming)
-session = build_doj_session()
-session.headers.update({"User-Agent": USER_AGENT})
+
+def new_session() -> requests.Session:
+    """
+    Create a DOJ-hardened session (cookies primed etc).
+    Re-create this when we detect /age-verify redirects.
+    """
+    s = build_doj_session()
+    s.headers.update({"User-Agent": USER_AGENT})
+    return s
+
+
+# Global session (can be replaced if it gets age-gated)
+session = new_session()
 
 
 # -----------------------------
@@ -76,12 +99,6 @@ _DOJ_BARE_RE = re.compile(
 
 
 def normalize_doj_url(url: str, dataset_id: int | None = None) -> str:
-    """
-    If URL is a bare DOJ epstein file URL (no DataSet path) and we have dataset_id,
-    rewrite to DataSet%20{dataset_id}/filename.pdf.
-
-    If dataset_id is unknown, leave as-is (we may relocate by probing later).
-    """
     if "/DataSet%20" in url:
         return url
 
@@ -89,27 +106,39 @@ def normalize_doj_url(url: str, dataset_id: int | None = None) -> str:
     if m and dataset_id:
         fn = m.group(1)
         return f"https://www.justice.gov/epstein/files/DataSet%20{int(dataset_id)}/{fn}"
-
     return url
+
+
+def _is_age_verify(resp: requests.Response) -> bool:
+    # DOJ redirects to /age-verify?destination=...
+    if resp is None:
+        return False
+    if resp.url and "/age-verify" in resp.url:
+        return True
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    if "text/html" in ct:
+        # Often age verify returns HTML, but HTML could be other error pages too.
+        # We'll still treat as non-PDF.
+        return True
+    return False
 
 
 def _probe_pdf_head(url: str) -> bool:
     """
-    Lightweight check: request stream and verify:
+    Lightweight check:
       - HTTP 200
       - Content-Type includes application/pdf
       - First bytes match PDF magic
+      - NOT redirected to age-verify
     """
     try:
         r = session.get(url, stream=True, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        ct = (r.headers.get("Content-Type") or "").lower()
-
-        if r.status_code != 200:
+        if _is_age_verify(r):
             r.close()
             return False
 
-        if "application/pdf" not in ct:
-            # Often DOJ gate pages come back as HTML
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if r.status_code != 200 or "application/pdf" not in ct:
             r.close()
             return False
 
@@ -121,13 +150,6 @@ def _probe_pdf_head(url: str) -> bool:
 
 
 def relocate_dataset_pdf(url: str, max_offset: int = 6, max_dataset: int = 99) -> str | None:
-    """
-    If url is .../DataSet XX/EFTA....pdf and returns 404 (or bad content),
-    try nearby datasets to find where the file actually lives.
-    Returns the working URL or None.
-
-    We probe: ds, ds-1, ds+1, ds-2, ds+2, ... up to max_offset.
-    """
     m = _DOJ_DATASET_RE.match(url)
     if not m:
         return None
@@ -150,10 +172,6 @@ def relocate_dataset_pdf(url: str, max_offset: int = 6, max_dataset: int = 99) -
 
 
 def locate_dataset_for_bare_url(url: str, max_dataset: int = 99) -> str | None:
-    """
-    If url is https://www.justice.gov/epstein/files/EFTAxxxx.pdf (no dataset),
-    try datasets 1..max_dataset and return the first that serves a real PDF.
-    """
     m = _DOJ_BARE_RE.match(url)
     if not m:
         return None
@@ -174,11 +192,6 @@ def _dataset_and_filename(url: str) -> tuple[int | None, str | None]:
 
 
 def _prefix_for_filename(filename: str) -> str:
-    """
-    Build a conservative prefix for bulk-missing.
-    Example:
-      EFTA00800101.pdf -> stem EFTA00800101 -> prefix EFTA008001 (drop last 2 digits)
-    """
     base = os.path.basename(filename)
     stem = base[:-4] if base.lower().endswith(".pdf") else base
     if len(stem) <= NUMERIC_SUFFIX_DROP:
@@ -196,10 +209,7 @@ def get_s3_client():
         endpoint_url=S3_ENDPOINT,
         aws_access_key_id=S3_ACCESS_KEY,
         aws_secret_access_key=S3_SECRET_KEY,
-        config=BotoConfig(
-            signature_version="s3v4",
-            retries={"max_attempts": 3},
-        ),
+        config=BotoConfig(signature_version="s3v4", retries={"max_attempts": 3}),
     )
 
 
@@ -231,16 +241,7 @@ def get_content_type(file_type: str) -> str:
 # -----------------------------
 
 def bulk_mark_missing_by_prefix(dataset_id: int, prefix: str, reason: str) -> int:
-    """
-    Mark ALL pending scraped_urls matching this dataset+prefix pattern as missing.
-
-    IMPORTANT: We intentionally match on URL (not dataset_id column) because dataset_id
-    in scraped_urls can be wrong until relocation corrects it.
-    """
-    # Match URLs like:
-    # https://www.justice.gov/epstein/files/DataSet%20{dataset_id}/{prefix}*.pdf
     pattern = f"https://www.justice.gov/epstein/files/DataSet%20{int(dataset_id)}/{prefix}%.pdf"
-
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -257,7 +258,6 @@ def bulk_mark_missing_by_prefix(dataset_id: int, prefix: str, reason: str) -> in
             )
             updated = cur.rowcount or 0
         conn.commit()
-
     return updated
 
 
@@ -265,15 +265,41 @@ def bulk_mark_missing_by_prefix(dataset_id: int, prefix: str, reason: str) -> in
 # Download + verify
 # -----------------------------
 
-def download_file(url: str, dest_path: str) -> tuple[str, int, str, str]:
+def _sniff_first_page_text_is_block_pdf(pdf_path: str) -> bool:
     """
-    Download a DOJ file and verify it is a real PDF.
+    Extract a bit of first-page text and look for the block signature.
+    We keep it cheap: first page only, limit chars.
+    """
+    try:
+        # pdftotext is usually available in your environment (you used it earlier)
+        proc = subprocess.run(
+            ["pdftotext", "-f", "1", "-l", "1", "-layout", pdf_path, "-"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        txt = (proc.stdout or b"").decode("utf-8", errors="replace")
+        head = txt[:SNIFF_CHARS]
+        # require at least two phrases to reduce false positives
+        hits = sum(1 for p in BLOCK_SIG_PHRASES if p in head)
+        return hits >= 2
+    except Exception:
+        # If sniff fails, don't classify as block (avoid dropping good PDFs)
+        return False
+
+
+def download_file(url: str, dest_path: str) -> tuple[str, int, str, str, str]:
+    """
+    Download a DOJ file and verify it is a real target PDF.
 
     Returns:
-        ("ok", size, sha256, final_url)
-        ("missing", 0, "", final_url)
-        ("error", 0, "", final_url)
+        ("ok", size, sha256, final_url, note)
+        ("missing", 0, "", final_url, note)
+        ("age_verify", 0, "", final_url, note)
+        ("blocked_pdf", size, sha256, final_url, note)  # downloaded a PDF, but it's the block/WAF PDF
+        ("error", 0, "", final_url, note)
     """
+    global session
     final_url = url
 
     for attempt in range(MAX_RETRIES):
@@ -285,6 +311,20 @@ def download_file(url: str, dest_path: str) -> tuple[str, int, str, str]:
                 allow_redirects=True,
             )
 
+            # Age verify / HTML gate
+            if _is_age_verify(resp):
+                note = f"age_verify_redirect:{resp.url}"
+                resp.close()
+
+                # Rebuild session and retry (cookies can expire)
+                logger.warning(f"Age-verify gate hit. Re-priming session. attempt={attempt+1}")
+                session = new_session()
+                time.sleep(REQUEST_DELAY * (attempt + 1))
+                # Don't relocate; it's not a dataset issue.
+                if attempt == MAX_RETRIES - 1:
+                    return "age_verify", 0, "", resp.url or final_url, note
+                continue
+
             # Handle 404 with relocation if possible
             if resp.status_code == 404:
                 resp.close()
@@ -295,24 +335,29 @@ def download_file(url: str, dest_path: str) -> tuple[str, int, str, str]:
                     final_url = relocated
                     continue
 
-                # If it was a bare URL, try locating dataset
                 bare_loc = locate_dataset_for_bare_url(final_url)
                 if bare_loc:
                     logger.info(f"  Located dataset for bare URL: {final_url} -> {bare_loc}")
                     final_url = bare_loc
                     continue
 
-                return "missing", 0, "", final_url
+                return "missing", 0, "", final_url, "404_not_found"
 
             ct = (resp.headers.get("Content-Type") or "").lower()
-            if "text/html" in ct:
+            if "application/pdf" not in ct:
+                # not a PDF (could be HTML error page even without /age-verify)
+                note = f"non_pdf_ct:{ct} status={resp.status_code}"
                 resp.close()
+
+                # relocation won't fix non-PDF unless it was the wrong dataset url;
+                # try relocation once via existing logic:
                 relocated = relocate_dataset_pdf(final_url)
                 if relocated and relocated != final_url:
-                    logger.info(f"  HTML response; relocating: {final_url} -> {relocated}")
+                    logger.info(f"  Non-PDF response; relocating: {final_url} -> {relocated}")
                     final_url = relocated
                     continue
-                raise requests.RequestException(f"HTML response status={resp.status_code} ct={ct}")
+
+                raise requests.RequestException(note)
 
             resp.raise_for_status()
 
@@ -322,15 +367,16 @@ def download_file(url: str, dest_path: str) -> tuple[str, int, str, str]:
             # Verify magic bytes first
             magic = resp.raw.read(len(PDF_MAGIC))
             if magic != PDF_MAGIC:
+                note = f"not_pdf_magic:{magic!r} status={resp.status_code} ct={ct}"
                 resp.close()
+
                 relocated = relocate_dataset_pdf(final_url)
                 if relocated and relocated != final_url:
-                    logger.info(f"  NOT_PDF; relocating: {final_url} -> {relocated}")
+                    logger.info(f"  NOT_PDF magic; relocating: {final_url} -> {relocated}")
                     final_url = relocated
                     continue
-                raise requests.RequestException(
-                    f"NOT_PDF magic={magic!r} status={resp.status_code} ct={ct}"
-                )
+
+                raise requests.RequestException(note)
 
             with open(dest_path, "wb") as f:
                 f.write(magic)
@@ -344,7 +390,12 @@ def download_file(url: str, dest_path: str) -> tuple[str, int, str, str]:
                         total_size += len(chunk)
 
             resp.close()
-            return "ok", total_size, sha256.hexdigest(), final_url
+
+            # Detect block/WAF PDF (PDF, but wrong content)
+            if _sniff_first_page_text_is_block_pdf(dest_path):
+                return "blocked_pdf", total_size, sha256.hexdigest(), final_url, "block_pdf_signature"
+
+            return "ok", total_size, sha256.hexdigest(), final_url, "ok"
 
         except requests.RequestException as e:
             logger.warning(f"Download attempt {attempt+1} failed for {final_url}: {e}")
@@ -356,14 +407,13 @@ def download_file(url: str, dest_path: str) -> tuple[str, int, str, str]:
                 except Exception:
                     pass
 
-    return "error", 0, "", final_url
+    return "error", 0, "", final_url, "max_retries_exceeded"
 
 
 def upload_to_s3(s3, local_path: str, s3_key: str, content_type: str | None = None) -> str:
     extra_args = {}
     if content_type:
         extra_args["ContentType"] = content_type
-
     s3.upload_file(local_path, S3_BUCKET, s3_key, ExtraArgs=extra_args)
     return f"{S3_PUBLIC_URL}/{s3_key}"
 
@@ -381,13 +431,12 @@ def process_downloads(limit: int = 500):
 
     downloaded = 0
     missing = 0
+    blocked = 0
+    age_gated = 0
     skipped_dupe = 0
     errors = 0
     bulk_skipped = 0
 
-    # FIX: the old "streak" required misses to be adjacent in the queue.
-    # But your queue is mixed by dataset / filename, so it rarely triggers.
-    # We instead count misses per (dataset,prefix) across the run.
     missing_counts: dict[tuple[int, str], int] = defaultdict(int)
     bulk_blocked: set[tuple[int, str]] = set()
 
@@ -413,7 +462,7 @@ def process_downloads(limit: int = 500):
         filename = "".join(c for c in filename if c.isalnum() or c in ".-_ ").strip() or f"file_{i}.{file_type}"
         temp_path = os.path.join(TEMP_DOWNLOAD_DIR, filename)
 
-        result, file_size, sha256, final_url = download_file(url, temp_path)
+        result, file_size, sha256, final_url, note = download_file(url, temp_path)
 
         # If we relocated to another dataset, trust final_url and fix dataset_id
         m = _DOJ_DATASET_RE.match(final_url)
@@ -429,10 +478,9 @@ def process_downloads(limit: int = 500):
 
         if result == "missing":
             logger.info(f"  NOT_FOUND (404): {final_url}")
-            mark_url_scraped(original_url, downloaded=True, status="missing")
+            mark_url_scraped(original_url, downloaded=True, status="missing", last_error=note)
             missing += 1
 
-            # Count "true missing" per (dataset,prefix) based on final_url
             ds_f, fn_f = _dataset_and_filename(final_url)
             if ds_f and fn_f:
                 prefix = _prefix_for_filename(fn_f)
@@ -451,16 +499,51 @@ def process_downloads(limit: int = 500):
                     except Exception as e:
                         logger.warning(f"  BULK-MISSING failed for {key}: {e}")
 
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+            continue
+
+        if result == "age_verify":
+            logger.warning(f"  AGE_VERIFY gate: {final_url}")
+            age_gated += 1
+            # Not downloaded; leave for retry later
+            mark_url_scraped(original_url, downloaded=False, status="age_verify", last_error=note)
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+            continue
+
+        if result == "blocked_pdf":
+            logger.warning(f"  BLOCKED_PDF detected (not ingesting): {final_url}")
+            blocked += 1
+            mark_url_scraped(original_url, downloaded=False, status="blocked_pdf", last_error=note)
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
             continue
 
         if result != "ok":
             logger.error(f"  Failed to download: {final_url} (result={result})")
             errors += 1
             try:
-                mark_url_scraped(original_url, downloaded=False, status="error", last_error=f"download_error:{result}")
+                mark_url_scraped(original_url, downloaded=False, status="error", last_error=f"download_error:{note}")
             except Exception:
                 pass
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
             continue
+
+        # From here: OK PDF only
 
         if document_exists(sha256_hash=sha256):
             skipped_dupe += 1
@@ -476,7 +559,12 @@ def process_downloads(limit: int = 500):
             logger.error(f"  S3 upload failed: {e}")
             errors += 1
             try:
-                mark_url_scraped(original_url, downloaded=False, status="error", last_error=f"s3_upload_failed:{type(e).__name__}")
+                mark_url_scraped(
+                    original_url,
+                    downloaded=False,
+                    status="error",
+                    last_error=f"s3_upload_failed:{type(e).__name__}",
+                )
             except Exception:
                 pass
             if os.path.exists(temp_path):
@@ -516,20 +604,28 @@ def process_downloads(limit: int = 500):
         time.sleep(REQUEST_DELAY)
 
     logger.info(
-        f"\nDownload complete: {downloaded} downloaded, {missing} missing(404), "
-        f"{skipped_dupe} dupes, {errors} errors, {bulk_skipped} bulk-skipped"
+        "\nDownload complete: "
+        f"{downloaded} downloaded, "
+        f"{missing} missing(404), "
+        f"{blocked} blocked_pdf, "
+        f"{age_gated} age_verify, "
+        f"{skipped_dupe} dupes, "
+        f"{errors} errors, "
+        f"{bulk_skipped} bulk-skipped"
     )
-    return downloaded, missing, skipped_dupe, errors
+    return downloaded, missing, blocked, age_gated, skipped_dupe, errors
 
 
 if __name__ == "__main__":
     init_db()
-    downloaded, missing, dupes, errors = process_downloads()
+    downloaded, missing, blocked, age_gated, dupes, errors = process_downloads()
 
     print(f"\n{'='*50}")
     print("Download Summary")
     print(f"{'='*50}")
-    print(f"Downloaded:  {downloaded}")
-    print(f"Missing:     {missing} (404)")
-    print(f"Duplicates:  {dupes} (sha256)")
-    print(f"Errors:      {errors}")
+    print(f"Downloaded:   {downloaded}")
+    print(f"Missing:      {missing} (404)")
+    print(f"Blocked PDFs: {blocked}")
+    print(f"Age Verify:   {age_gated}")
+    print(f"Duplicates:   {dupes} (sha256)")
+    print(f"Errors:       {errors}")
