@@ -10,22 +10,20 @@ import sys
 import logging
 from datetime import datetime
 
+# Ensure project root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from config.settings import LOG_DIR
 from db.database import init_db, get_db, insert_monitor_log, query_val
 from crawler.url_generator import scan_all_datasets, get_scan_summary
 from crawler.downloader import process_downloads
-from crawler.metadata_extractor import (
-    process_unindexed_documents, process_images, process_videos
-)
+from crawler.metadata_extractor import process_unindexed_documents, process_images, process_videos
 
 os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-    ]
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger("daily_monitor")
 
@@ -41,9 +39,12 @@ def run_daily_check():
     logger.info("STEP 1: Scanning for new EFTA file URLs...")
     try:
         new_found, urls_checked, datasets_done = scan_all_datasets(batch_per_dataset=100)
-        logger.info(f"Scan: {new_found} new files found, {urls_checked} URLs checked, {datasets_done}/12 datasets complete")
+        logger.info(
+            f"Scan: {new_found} new files found, {urls_checked} URLs checked, "
+            f"{datasets_done}/12 datasets complete"
+        )
     except Exception as e:
-        logger.error(f"URL scanning failed: {e}")
+        logger.exception("URL scanning failed")
         insert_monitor_log("doj_efta", "error", f"Scan failed: {e}")
         return
 
@@ -57,15 +58,21 @@ def run_daily_check():
     downloaded = 0
     skipped = 0
     errors = 0
-    if pending > 0:
+    missing = 0
+
+    if pending and pending > 0:
         logger.info("STEP 2: Downloading new files...")
         try:
-        downloaded, skipped, errors, missing = process_downloads(limit=2000)
+            # process_downloads now returns 4 values
+            downloaded, skipped, errors, missing = process_downloads(limit=2000)
+            logger.info(
+                f"Downloaded: {downloaded}, Missing: {missing}, "
+                f"Skipped: {skipped}, Errors: {errors}"
+            )
         except Exception as e:
-            logger.error(f"Download failed: {e}")
+            logger.exception("Download failed")
             insert_monitor_log("doj_efta", "error", f"Download failed: {e}")
             return
-    logger.info(f"Downloaded: {downloaded}, Missing: {missing}, Skipped: {skipped}, Errors: {errors}")
     else:
         logger.info("STEP 2: No new files to download")
 
@@ -77,8 +84,9 @@ def run_daily_check():
         processed, extract_errors = process_unindexed_documents(limit=200)
         process_images(limit=200)
         process_videos(limit=200)
+        logger.info(f"Indexed: {processed}, Extract errors: {extract_errors}")
     except Exception as e:
-        logger.error(f"Extraction failed: {e}")
+        logger.exception("Extraction failed")
         insert_monitor_log("doj_efta", "error", f"Extraction failed: {e}")
         return
 
@@ -94,7 +102,7 @@ def run_daily_check():
         result = f"Scan: {urls_checked} checked, {new_found} new. {datasets_done}/12 datasets scanned."
 
     scan_summary = get_scan_summary()
-    total_files_found = sum(s["files_found"] for s in scan_summary)
+    total_files_found = sum(s.get("files_found", 0) for s in scan_summary)
 
     insert_monitor_log(
         source="doj_efta",
@@ -107,13 +115,15 @@ def run_daily_check():
             "datasets_complete": datasets_done,
             "total_files_discovered": total_files_found,
             "downloaded": downloaded,
+            "missing": missing,
             "skipped": skipped,
             "indexed": processed,
+            "extract_errors": extract_errors,
             "errors": errors,
-        }
+        },
     )
 
-    logger.info(f"\nDaily monitor complete: {result}")
+    logger.info(f"Daily monitor complete: {result}")
     logger.info(f"Total EFTA files discovered so far: {total_files_found}")
     logger.info("=" * 60)
 
