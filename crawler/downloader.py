@@ -61,4 +61,4 @@ DOJ_WARMUP_URL = "https://www.justice.gov/epstein/files/DataSet%2010/EFTA0160215
 DOWNLOAD_WORKERS = max(1, int(os.environ.get("DOWNLOADER_WORKERS", str(MAX_CONCURRENT_DOWNLOADS or 3))))
 DATASET_FOCUS = os.environ.get("DATASET_FOCUS", "").strip()
 DATASET_FOCUS = int(DATASET_FOCUS) if DATASET_FOCUS.isdigit() else None
-    print(f"Errors:       {errors}")
+print(f"Errors:       {errors}")
