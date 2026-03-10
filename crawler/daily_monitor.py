@@ -1,8 +1,8 @@
 """
 Daily Monitor — Designed to run as a cron job.
-1. Scans for new EFTA file URLs by sequential number checking
+1. Optionally scans for new EFTA file URLs by sequential number checking
 2. Downloads any new files to DreamObjects
-3. Extracts text and tags persons
+3. Optionally extracts text and tags persons
 4. Logs activity
 """
 import os
@@ -10,7 +10,6 @@ import sys
 import logging
 from datetime import datetime
 
-# Ensure project root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import LOG_DIR
@@ -27,106 +26,37 @@ logging.basicConfig(
 )
 logger = logging.getLogger("daily_monitor")
 
+SKIP_SCAN = os.environ.get("SKIP_SCAN", "false").lower() == "true"
+DOWNLOAD_ONLY = os.environ.get("DOWNLOAD_ONLY", "false").lower() == "true"
+DOWNLOAD_BATCH = int(os.environ.get("DOWNLOAD_BATCH", "2000"))
+DATASET_FOCUS = os.environ.get("DATASET_FOCUS", "").strip()
+DATASET_FOCUS = int(DATASET_FOCUS) if DATASET_FOCUS.isdigit() else None
+
 
 def run_daily_check():
     logger.info("=" * 60)
     logger.info(f"DAILY DOJ MONITOR — {datetime.now().isoformat()}")
     logger.info("=" * 60)
+    logger.info(
+        f"Config: SKIP_SCAN={SKIP_SCAN}, DOWNLOAD_ONLY={DOWNLOAD_ONLY}, "
+        f"DOWNLOAD_BATCH={DOWNLOAD_BATCH}, DATASET_FOCUS={DATASET_FOCUS}"
+    )
 
     init_db()
 
-    # ── STEP 1: Scan for new EFTA file URLs ──
-    logger.info("STEP 1: Scanning for new EFTA file URLs...")
-    try:
-        new_found, urls_checked, datasets_done = scan_all_datasets(batch_per_dataset=100)
-        logger.info(
-            f"Scan: {new_found} new files found, {urls_checked} URLs checked, "
-            f"{datasets_done}/12 datasets complete"
-        )
-    except Exception as e:
-        logger.exception("URL scanning failed")
-        insert_monitor_log("doj_efta", "error", f"Scan failed: {e}")
-        return
+    new_found = 0
+    urls_checked = 0
+    datasets_done = 0
 
-    # Check pending downloads
-    with get_db() as conn:
-        pending = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE downloaded=0")
-
-    logger.info(f"Pending downloads: {pending}")
-
-    # ── STEP 2: Download new files ──
-    downloaded = 0
-    skipped = 0
-    errors = 0
-    missing = 0
-
-    if pending and pending > 0:
-        logger.info("STEP 2: Downloading new files...")
+    if not SKIP_SCAN:
+        logger.info("STEP 1: Scanning for new EFTA file URLs...")
         try:
-            # process_downloads now returns 4 values
-            downloaded, skipped, errors, missing = process_downloads(limit=2000)
+            if DATASET_FOCUS is not None:
+                logger.info(
+                    "Dataset focus is enabled. Scanner may still scan broadly depending on "
+                    "url_generator implementation, but downloader will only process the focus dataset."
+                )
+            new_found, urls_checked, datasets_done = scan_all_datasets(batch_per_dataset=100)
             logger.info(
-                f"Downloaded: {downloaded}, Missing: {missing}, "
-                f"Skipped: {skipped}, Errors: {errors}"
-            )
-        except Exception as e:
-            logger.exception("Download failed")
-            insert_monitor_log("doj_efta", "error", f"Download failed: {e}")
-            return
-    else:
-        logger.info("STEP 2: No new files to download")
-
-    # ── STEP 3: Index new files ──
-    logger.info("STEP 3: Extracting metadata from new files...")
-    processed = 0
-    extract_errors = 0
-    try:
-        processed, extract_errors = process_unindexed_documents(limit=200)
-        process_images(limit=200)
-        process_videos(limit=200)
-        logger.info(f"Indexed: {processed}, Extract errors: {extract_errors}")
-    except Exception as e:
-        logger.exception("Extraction failed")
-        insert_monitor_log("doj_efta", "error", f"Extraction failed: {e}")
-        return
-
-    # ── STEP 4: Log results ──
-    if downloaded > 0 or new_found > 10:
-        status = "major" if downloaded > 50 else "update"
-        result = f"{downloaded} new files downloaded, {processed} indexed"
-    elif new_found > 0:
-        status = "update"
-        result = f"{new_found} new URLs found, {downloaded} downloaded"
-    else:
-        status = "checked"
-        result = f"Scan: {urls_checked} checked, {new_found} new. {datasets_done}/12 datasets scanned."
-
-    scan_summary = get_scan_summary()
-    total_files_found = sum(s.get("files_found", 0) for s in scan_summary)
-
-    insert_monitor_log(
-        source="doj_efta",
-        status=status,
-        result=result,
-        new_files=downloaded,
-        details={
-            "new_urls_found": new_found,
-            "urls_checked": urls_checked,
-            "datasets_complete": datasets_done,
-            "total_files_discovered": total_files_found,
-            "downloaded": downloaded,
-            "missing": missing,
-            "skipped": skipped,
-            "indexed": processed,
-            "extract_errors": extract_errors,
-            "errors": errors,
-        },
-    )
-
-    logger.info(f"Daily monitor complete: {result}")
-    logger.info(f"Total EFTA files discovered so far: {total_files_found}")
-    logger.info("=" * 60)
-
-
-if __name__ == "__main__":
+                f"Scan: {new_found} new files found, {urls_checked} URLs checked, "
     run_daily_check()
