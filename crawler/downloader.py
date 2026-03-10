@@ -1,8 +1,3 @@
-# DocketZero replacement files
-
-## 1) `crawler/downloader.py`
-
-```python
 """
 Downloader — Downloads scraped file URLs from the DOJ and uploads
 them to DreamObjects (S3-compatible cloud storage).
@@ -62,7 +57,6 @@ BLOCK_SIG_PHRASES = (
 SNIFF_CHARS = 2500
 DOJ_WARMUP_URL = "https://www.justice.gov/epstein/files/DataSet%2010/EFTA01602154.pdf"
 
-# Optional env overrides
 DOWNLOAD_WORKERS = max(1, int(os.environ.get("DOWNLOADER_WORKERS", str(MAX_CONCURRENT_DOWNLOADS or 3))))
 DATASET_FOCUS = os.environ.get("DATASET_FOCUS", "").strip()
 DATASET_FOCUS = int(DATASET_FOCUS) if DATASET_FOCUS.isdigit() else None
@@ -155,11 +149,16 @@ def relocate_dataset_pdf(s: requests.Session, url: str, max_offset: int = 6, max
 
     ds = int(m.group(1))
     fn = m.group(2)
-    candidates: list[int] = [ds]
+    candidates = [ds]
     for k in range(1, max_offset + 1):
         for d in (ds - k, ds + k):
             if 1 <= d <= max_dataset:
                 candidates.append(d)
+
+    if DATASET_FOCUS is not None:
+        candidates = [d for d in candidates if d == DATASET_FOCUS]
+        if not candidates:
+            return None
 
     for d in candidates:
         test_url = f"https://www.justice.gov/epstein/files/DataSet%20{d}/{fn}"
@@ -174,7 +173,7 @@ def locate_dataset_for_bare_url(s: requests.Session, url: str, max_dataset: int 
         return None
 
     fn = m.group(1)
-    search_range = [DATASET_FOCUS] if DATASET_FOCUS else range(1, max_dataset + 1)
+    search_range = [DATASET_FOCUS] if DATASET_FOCUS is not None else range(1, max_dataset + 1)
     for d in search_range:
         test_url = f"https://www.justice.gov/epstein/files/DataSet%20{d}/{fn}"
         if _probe_pdf_head_with_session(s, test_url):
@@ -385,19 +384,20 @@ def _sniff_first_page_text_is_block_pdf(pdf_path: str) -> bool:
         return False
 
 
-def download_file(s: requests.Session, url: str, dest_path: str) -> tuple[str, int, str, str, str]:
+def download_file(session: requests.Session, url: str, dest_path: str) -> tuple[str, int, str, str, str]:
     final_url = url
+    worker_session = session
 
     for attempt in range(MAX_RETRIES):
         try:
-            resp = s.get(final_url, stream=True, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            resp = worker_session.get(final_url, stream=True, timeout=REQUEST_TIMEOUT, allow_redirects=True)
 
             if _is_age_verify(resp):
                 note = f"age_verify:{resp.url}"
                 resp.close()
                 logger.warning("Age-verify gate hit. Rebuilding worker session + warmup.")
-                s = new_session()
-                time.sleep(REQUEST_DELAY)
+                worker_session = new_session()
+                time.sleep(min(1.0, REQUEST_DELAY))
                 if attempt == 0:
                     continue
                 return "age_verify", 0, "", final_url, note
@@ -405,12 +405,12 @@ def download_file(s: requests.Session, url: str, dest_path: str) -> tuple[str, i
             if resp.status_code == 404:
                 resp.close()
 
-                relocated = relocate_dataset_pdf(s, final_url)
+                relocated = relocate_dataset_pdf(worker_session, final_url)
                 if relocated:
                     final_url = relocated
                     continue
 
-                bare_loc = locate_dataset_for_bare_url(s, final_url)
+                bare_loc = locate_dataset_for_bare_url(worker_session, final_url)
                 if bare_loc:
                     final_url = bare_loc
                     continue
@@ -422,7 +422,7 @@ def download_file(s: requests.Session, url: str, dest_path: str) -> tuple[str, i
                 note = f"non_pdf_ct:{ct} status={resp.status_code}"
                 resp.close()
 
-                relocated = relocate_dataset_pdf(s, final_url)
+                relocated = relocate_dataset_pdf(worker_session, final_url)
                 if relocated and relocated != final_url:
                     final_url = relocated
                     continue
@@ -439,7 +439,7 @@ def download_file(s: requests.Session, url: str, dest_path: str) -> tuple[str, i
                 note = f"not_pdf_magic:{magic!r} status={resp.status_code} ct={ct}"
                 resp.close()
 
-                relocated = relocate_dataset_pdf(s, final_url)
+                relocated = relocate_dataset_pdf(worker_session, final_url)
                 if relocated and relocated != final_url:
                     final_url = relocated
                     continue
@@ -465,7 +465,7 @@ def download_file(s: requests.Session, url: str, dest_path: str) -> tuple[str, i
             return "ok", total_size, sha256.hexdigest(), final_url, "ok"
 
         except requests.RequestException as e:
-            logger.warning(f"Download attempt {attempt+1} failed for {final_url}: {e}")
+            logger.warning(f"Download attempt {attempt + 1} failed for {final_url}: {e}")
             time.sleep(max(0.1, REQUEST_DELAY * (attempt + 1) * 0.25))
             if os.path.exists(dest_path):
                 try:
@@ -510,19 +510,47 @@ def _process_one(entry: dict) -> dict:
         url_for_mark = reconcile_scraped_url(original_url, final_url, dataset_id, file_type)
 
         if result == "missing":
-            mark_url_scraped(url_for_mark, dataset_id=dataset_id, file_type=file_type, downloaded=True, status="missing", last_error=note)
+            mark_url_scraped(
+                url_for_mark,
+                dataset_id=dataset_id,
+                file_type=file_type,
+                downloaded=True,
+                status="missing",
+                last_error=note,
+            )
             return {"result": "missing", "dataset_id": dataset_id, "final_url": final_url}
 
         if result == "age_verify":
-            mark_url_scraped(url_for_mark, dataset_id=dataset_id, file_type=file_type, downloaded=False, status="age_verify", last_error=note)
+            mark_url_scraped(
+                url_for_mark,
+                dataset_id=dataset_id,
+                file_type=file_type,
+                downloaded=False,
+                status="age_verify",
+                last_error=note,
+            )
             return {"result": "age_verify", "dataset_id": dataset_id}
 
         if result == "blocked_pdf":
-            mark_url_scraped(url_for_mark, dataset_id=dataset_id, file_type=file_type, downloaded=False, status="blocked_pdf", last_error=note)
+            mark_url_scraped(
+                url_for_mark,
+                dataset_id=dataset_id,
+                file_type=file_type,
+                downloaded=False,
+                status="blocked_pdf",
+                last_error=note,
+            )
             return {"result": "blocked_pdf", "dataset_id": dataset_id}
 
         if result != "ok":
-            mark_url_scraped(url_for_mark, dataset_id=dataset_id, file_type=file_type, downloaded=False, status="error", last_error=f"download_error:{note}")
+            mark_url_scraped(
+                url_for_mark,
+                dataset_id=dataset_id,
+                file_type=file_type,
+                downloaded=False,
+                status="error",
+                last_error=f"download_error:{note}",
+            )
             return {"result": "error", "dataset_id": dataset_id, "error": note}
 
         dupe = document_exists(sha256_hash=sha256)
@@ -532,7 +560,14 @@ def _process_one(entry: dict) -> dict:
         try:
             s3_url = upload_to_s3(s3, temp_path, s3_key, get_content_type(file_type))
         except Exception as e:
-            mark_url_scraped(url_for_mark, dataset_id=dataset_id, file_type=file_type, downloaded=False, status="error", last_error=f"s3_upload_failed:{type(e).__name__}")
+            mark_url_scraped(
+                url_for_mark,
+                dataset_id=dataset_id,
+                file_type=file_type,
+                downloaded=False,
+                status="error",
+                last_error=f"s3_upload_failed:{type(e).__name__}",
+            )
             return {"result": "error", "dataset_id": dataset_id, "error": str(e)}
 
         file_id = f"DS{dataset_id or 0}-{sha256[:8]}"
@@ -553,7 +588,14 @@ def _process_one(entry: dict) -> dict:
         }
         upsert_document_by_filename(doc)
 
-        mark_url_scraped(url_for_mark, dataset_id=dataset_id, file_type=file_type, downloaded=True, status="downloaded", last_error=None)
+        mark_url_scraped(
+            url_for_mark,
+            dataset_id=dataset_id,
+            file_type=file_type,
+            downloaded=True,
+            status="downloaded",
+            last_error=None,
+        )
 
         time.sleep(random.uniform(JITTER_MIN, JITTER_MAX))
         return {"result": "downloaded", "dataset_id": dataset_id, "dupe": dupe}
@@ -649,202 +691,13 @@ def process_downloads(limit: int = 500):
 if __name__ == "__main__":
     init_db()
     downloaded, missing, blocked, age_gated, dupes, errors = process_downloads()
-    print(f"\n{'='*50}")
+
+    print("\n" + "=" * 50)
     print("Download Summary")
-    print(f"{'='*50}")
+    print("=" * 50)
     print(f"Downloaded:   {downloaded}")
     print(f"Missing:      {missing} (404)")
     print(f"Blocked PDFs: {blocked}")
     print(f"Age Verify:   {age_gated}")
     print(f"Duplicates:   {dupes} (sha256)")
     print(f"Errors:       {errors}")
-```
-
-## 2) `crawler/daily_monitor.py`
-
-```python
-"""
-Daily Monitor — Designed to run as a cron job.
-1. Optionally scans for new EFTA file URLs by sequential number checking
-2. Downloads any new files to DreamObjects
-3. Optionally extracts text and tags persons
-4. Logs activity
-"""
-import os
-import sys
-import logging
-from datetime import datetime
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from config.settings import LOG_DIR
-from db.database import init_db, get_db, insert_monitor_log, query_val
-from crawler.url_generator import scan_all_datasets, get_scan_summary
-from crawler.downloader import process_downloads
-from crawler.metadata_extractor import process_unindexed_documents, process_images, process_videos
-
-os.makedirs(LOG_DIR, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-logger = logging.getLogger("daily_monitor")
-
-SKIP_SCAN = os.environ.get("SKIP_SCAN", "false").lower() == "true"
-DOWNLOAD_ONLY = os.environ.get("DOWNLOAD_ONLY", "false").lower() == "true"
-DOWNLOAD_BATCH = int(os.environ.get("DOWNLOAD_BATCH", "2000"))
-DATASET_FOCUS = os.environ.get("DATASET_FOCUS", "").strip()
-DATASET_FOCUS = int(DATASET_FOCUS) if DATASET_FOCUS.isdigit() else None
-
-
-def run_daily_check():
-    logger.info("=" * 60)
-    logger.info(f"DAILY DOJ MONITOR — {datetime.now().isoformat()}")
-    logger.info("=" * 60)
-    logger.info(
-        f"Config: SKIP_SCAN={SKIP_SCAN}, DOWNLOAD_ONLY={DOWNLOAD_ONLY}, "
-        f"DOWNLOAD_BATCH={DOWNLOAD_BATCH}, DATASET_FOCUS={DATASET_FOCUS}"
-    )
-
-    init_db()
-
-    new_found = 0
-    urls_checked = 0
-    datasets_done = 0
-
-    if not SKIP_SCAN:
-        logger.info("STEP 1: Scanning for new EFTA file URLs...")
-        try:
-            if DATASET_FOCUS is not None:
-                logger.info(
-                    "Dataset focus is enabled. Scanner may still scan broadly depending on "
-                    "url_generator implementation, but downloader will only process the focus dataset."
-                )
-            new_found, urls_checked, datasets_done = scan_all_datasets(batch_per_dataset=100)
-            logger.info(
-                f"Scan: {new_found} new files found, {urls_checked} URLs checked, "
-                f"{datasets_done}/12 datasets complete"
-            )
-        except Exception as e:
-            logger.exception("URL scanning failed")
-            insert_monitor_log("doj_efta", "error", f"Scan failed: {e}")
-            return
-    else:
-        logger.info("STEP 1: Scan skipped by SKIP_SCAN=true")
-
-    with get_db() as conn:
-        if DATASET_FOCUS is not None:
-            pending = query_val(
-                conn,
-                "SELECT COUNT(*) FROM scraped_urls WHERE status='pending' AND dataset_id=%s",
-                (DATASET_FOCUS,),
-            )
-        else:
-            pending = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE status='pending'")
-
-    logger.info(f"Pending downloads: {pending}")
-
-    downloaded = 0
-    missing = 0
-    blocked = 0
-    age_gated = 0
-    dupes = 0
-    errors = 0
-
-    if pending and pending > 0:
-        logger.info("STEP 2: Downloading new files...")
-        try:
-            downloaded, missing, blocked, age_gated, dupes, errors = process_downloads(limit=DOWNLOAD_BATCH)
-            logger.info(
-                f"Downloaded: {downloaded}, Missing: {missing}, Blocked: {blocked}, "
-                f"Age-gated: {age_gated}, Dupes: {dupes}, Errors: {errors}"
-            )
-        except Exception as e:
-            logger.exception("Download failed")
-            insert_monitor_log("doj_efta", "error", f"Download failed: {e}")
-            return
-    else:
-        logger.info("STEP 2: No pending files to download")
-
-    processed = 0
-    extract_errors = 0
-    if not DOWNLOAD_ONLY:
-        logger.info("STEP 3: Extracting metadata from new files...")
-        try:
-            processed, extract_errors = process_unindexed_documents(limit=200)
-            process_images(limit=200)
-            process_videos(limit=200)
-            logger.info(f"Indexed: {processed}, Extract errors: {extract_errors}")
-        except Exception as e:
-            logger.exception("Extraction failed")
-            insert_monitor_log("doj_efta", "error", f"Extraction failed: {e}")
-            return
-    else:
-        logger.info("STEP 3: Extraction skipped by DOWNLOAD_ONLY=true")
-
-    if downloaded > 0:
-        status = "major" if downloaded > 50 else "update"
-        result = f"{downloaded} new files downloaded"
-        if not DOWNLOAD_ONLY:
-            result += f", {processed} indexed"
-    elif new_found > 0:
-        status = "update"
-        result = f"{new_found} new URLs found, {downloaded} downloaded"
-    else:
-        status = "checked"
-        result = f"Scan: {urls_checked} checked, {new_found} new. {datasets_done}/12 datasets scanned."
-
-    scan_summary = []
-    total_files_found = 0
-    try:
-        scan_summary = get_scan_summary()
-        total_files_found = sum(s.get("files_found", 0) for s in scan_summary)
-    except Exception:
-        pass
-
-    insert_monitor_log(
-        source="doj_efta",
-        status=status,
-        result=result,
-        new_files=downloaded,
-        details={
-            "dataset_focus": DATASET_FOCUS,
-            "new_urls_found": new_found,
-            "urls_checked": urls_checked,
-            "datasets_complete": datasets_done,
-            "total_files_discovered": total_files_found,
-            "downloaded": downloaded,
-            "missing": missing,
-            "blocked": blocked,
-            "age_gated": age_gated,
-            "duplicates": dupes,
-            "indexed": processed,
-            "extract_errors": extract_errors,
-            "errors": errors,
-            "skip_scan": SKIP_SCAN,
-            "download_only": DOWNLOAD_ONLY,
-            "download_batch": DOWNLOAD_BATCH,
-        },
-    )
-
-    logger.info(f"Daily monitor complete: {result}")
-    logger.info(f"Total EFTA files discovered so far: {total_files_found}")
-    logger.info("=" * 60)
-
-
-if __name__ == "__main__":
-    run_daily_check()
-```
-
-## Render env vars to add now
-
-```bash
-DATASET_FOCUS=10
-SKIP_SCAN=true
-DOWNLOAD_ONLY=true
-DOWNLOADER_WORKERS=8
-DOWNLOAD_BATCH=5000
-DOWNLOADER_JITTER_MIN=0.05
-DOWNLOADER_JITTER_MAX=0.20
-```
