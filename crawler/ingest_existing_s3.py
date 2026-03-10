@@ -1,16 +1,16 @@
 """
 Ingest existing PDFs already stored in DreamObjects into the documents table.
 
-Scans keys like:
-  epstein_pdfs/Data Set 10/EFTA01262782.pdf
+Actual key format in this bucket:
+  dataset_10/pdf/EFTA01262782.pdf
 
 Creates/updates rows in public.documents without re-downloading files.
 Skips non-PDF files like zip archives.
 
 Optional env vars:
-  DATASET_FOCUS=10        # only ingest one dataset
-  INGEST_PREFIX=epstein_pdfs/
-  INGEST_LIMIT=0          # 0 = no limit
+  DATASET_FOCUS=10
+  INGEST_PREFIX=dataset_
+  INGEST_LIMIT=0
 """
 
 import os
@@ -42,11 +42,13 @@ logging.basicConfig(
 logger = logging.getLogger("ingest_existing_s3")
 
 INGEST_PREFIX = os.environ.get("INGEST_PREFIX", "dataset_")
-DATASET_KEY_RE = re.compile(r"^dataset_(\d+)/pdf/(.*)$", re.IGNORECASE)
+DATASET_FOCUS_RAW = os.environ.get("DATASET_FOCUS", "").strip()
 DATASET_FOCUS = int(DATASET_FOCUS_RAW) if DATASET_FOCUS_RAW.isdigit() else None
 INGEST_LIMIT = int(os.environ.get("INGEST_LIMIT", "0"))
 
-DATASET_KEY_RE = re.compile(r"^epstein_pdfs/Data Set (\d+)/(.*)$", re.IGNORECASE)
+# Actual object key format:
+# dataset_10/pdf/EFTA01262782.pdf
+DATASET_KEY_RE = re.compile(r"^dataset_(\d+)/pdf/(.+)$", re.IGNORECASE)
 PDF_NAME_RE = re.compile(r"^(EFTA|EFTR).+\.pdf$", re.IGNORECASE)
 
 
@@ -77,10 +79,6 @@ def iter_s3_objects(s3, bucket: str, prefix: str):
 
 
 def upsert_document(conn, doc: dict) -> str:
-    """
-    Upsert by s3_key first, then by filename+dataset_id fallback.
-    Returns: inserted | updated | skipped
-    """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT id FROM public.documents WHERE s3_key = %s LIMIT 1",
@@ -239,7 +237,6 @@ def main():
                 skipped += 1
                 continue
 
-            # Skip tiny junk files
             if size < 100:
                 skipped += 1
                 continue
