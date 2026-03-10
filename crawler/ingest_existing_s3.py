@@ -41,8 +41,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ingest_existing_s3")
 
-INGEST_PREFIX = os.environ.get("INGEST_PREFIX", "epstein_pdfs/")
-DATASET_FOCUS_RAW = os.environ.get("DATASET_FOCUS", "").strip()
+INGEST_PREFIX = os.environ.get("INGEST_PREFIX", "dataset_")
+DATASET_KEY_RE = re.compile(r"^dataset_(\d+)/pdf/(.*)$", re.IGNORECASE)
 DATASET_FOCUS = int(DATASET_FOCUS_RAW) if DATASET_FOCUS_RAW.isdigit() else None
 INGEST_LIMIT = int(os.environ.get("INGEST_LIMIT", "0"))
 
