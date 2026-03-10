@@ -59,4 +59,11 @@ def run_daily_check():
             new_found, urls_checked, datasets_done = scan_all_datasets(batch_per_dataset=100)
             logger.info(
                 f"Scan: {new_found} new files found, {urls_checked} URLs checked, "
+                f"{datasets_done}/12 datasets complete"
+            )
+        except Exception as e:
+            logger.exception("URL scanning failed")
+            insert_monitor_log("doj_efta", "error", f"Scan failed: {e}")
+            return
+    else:
     run_daily_check()
