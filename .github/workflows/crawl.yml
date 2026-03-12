@@ -31,4 +31,7 @@ jobs:
           S3_ACCESS_KEY: ${{ secrets.DREAMHOST_ACCESS_KEY }}
           S3_SECRET_KEY: ${{ secrets.DREAMHOST_SECRET_KEY }}
           S3_BUCKET: ${{ secrets.DREAMHOST_BUCKET }}
+          DOWNLOADER_WORKERS: "1"
+          DOWNLOADER_JITTER_MIN: "3.0"
+          DOWNLOADER_JITTER_MAX: "7.0"
         run: python crawler/daily_monitor.py
