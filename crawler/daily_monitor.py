@@ -65,7 +65,7 @@ def run_daily_check():
             logger.exception("URL scanning failed")
             insert_monitor_log("doj_efta", "error", f"Scan failed: {e}")
             return
-  else:
+    else:
         logger.info("Skipping URL scan — SKIP_SCAN is enabled.")
 
     logger.info("STEP 2: Downloading new files to DreamObjects...")
