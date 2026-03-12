@@ -65,5 +65,29 @@ def run_daily_check():
             logger.exception("URL scanning failed")
             insert_monitor_log("doj_efta", "error", f"Scan failed: {e}")
             return
-    else:
-    run_daily_check()
+  else:
+        logger.info("Skipping URL scan — SKIP_SCAN is enabled.")
+
+    logger.info("STEP 2: Downloading new files to DreamObjects...")
+    try:
+        process_downloads(batch=DOWNLOAD_BATCH, dataset_focus=DATASET_FOCUS)
+    except Exception as e:
+        logger.exception("Download step failed")
+        insert_monitor_log("doj_efta", "error", f"Download failed: {e}")
+        return
+
+    if not DOWNLOAD_ONLY:
+        logger.info("STEP 3: Extracting metadata...")
+        try:
+            process_unindexed_documents()
+            process_images()
+            process_videos()
+        except Exception as e:
+            logger.exception("Metadata extraction failed")
+            insert_monitor_log("doj_efta", "error", f"Metadata failed: {e}")
+
+    insert_monitor_log("doj_efta", "success", "Daily monitor complete")
+    logger.info("Daily monitor complete.")
+
+
+run_daily_check()
