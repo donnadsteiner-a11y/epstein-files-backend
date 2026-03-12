@@ -319,10 +319,10 @@ def get_s3_client():
 def ensure_bucket_exists(s3):
     try:
         s3.head_bucket(Bucket=S3_BUCKET)
-        logger.info(f"Bucket '{S3_BUCKET}' exists")
-    except Exception:
-        logger.info(f"Creating bucket '{S3_BUCKET}'")
-        s3.create_bucket(Bucket=S3_BUCKET)
+        logger.info(f"Bucket '{S3_BUCKET}' accessible")
+    except Exception as e:
+        logger.error(f"Cannot access bucket '{S3_BUCKET}': {e}")
+        raise
 
 
 def get_content_type(file_type: str) -> str:
