@@ -70,7 +70,7 @@ def run_daily_check():
 
     logger.info("STEP 2: Downloading new files to DreamObjects...")
     try:
-        process_downloads(batch=DOWNLOAD_BATCH, dataset_focus=DATASET_FOCUS)
+     process_downloads(limit=DOWNLOAD_BATCH)
     except Exception as e:
         logger.exception("Download step failed")
         insert_monitor_log("doj_efta", "error", f"Download failed: {e}")
