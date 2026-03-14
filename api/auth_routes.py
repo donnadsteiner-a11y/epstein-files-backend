@@ -1,27 +1,9 @@
 """
 api/auth_routes.py — DocketZero Authentication Blueprint
-Add to epstein-files-backend on Render.
-
-SETUP:
-1. Add to requirements.txt:
-       flask-jwt-extended>=4.6
-       bcrypt>=4.0        (werkzeug already hashes, but this adds belt-and-suspenders)
-
-2. In your main app.py / app factory, register this blueprint:
-       from auth_routes import auth_bp
-       app.register_blueprint(auth_bp)
-
-3. Add to Render environment variables:
-       JWT_SECRET_KEY   →  a long random string (use: python -c "import secrets; print(secrets.token_hex(32))")
-
-4. Run the schema migration (schema_update.sql) against epstein-files-db.
-
-5. Add CORS header for /auth/* if your frontend is on a different domain (DreamHost):
-       from flask_cors import CORS
-       CORS(app, resources={r"/auth/*": {"origins": "https://docketzero.com"}})
 """
 
 from flask import Blueprint, request, jsonify
+from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import (
     create_access_token,
@@ -36,6 +18,7 @@ import re
 from datetime import timedelta
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
+CORS(auth_bp, origins=["https://docketzero.com", "http://docketzero.com", "http://localhost"])
 
 # ─── DB ──────────────────────────────────────────────────────────────
 def get_db():
@@ -49,7 +32,7 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 def valid_email(email: str) -> bool:
     return bool(_EMAIL_RE.match(email))
 
-def fmt_dt(dt) -> str | None:
+def fmt_dt(dt):
     return dt.isoformat() if dt else None
 
 
@@ -84,7 +67,7 @@ def register():
         conn.close()
     except psycopg2.errors.UniqueViolation:
         return jsonify({"error": "An account with that email already exists."}), 409
-    except Exception as e:
+    except Exception:
         return jsonify({"error": "Registration failed. Please try again."}), 500
 
     access_token = create_access_token(
@@ -125,8 +108,10 @@ def login():
         return jsonify({"error": "Login failed. Please try again."}), 500
 
     if not row or not check_password_hash(row[2], password):
-        if "conn" in dir():
+        try:
             conn.close()
+        except Exception:
+            pass
         return jsonify({"error": "Invalid email or password."}), 401
 
     try:
@@ -196,12 +181,10 @@ def me():
 @auth_bp.route("/logout", methods=["POST"])
 @jwt_required()
 def logout():
-    # JWT is stateless — the client deletes the token.
-    # For a server-side blocklist, store get_jwt()["jti"] in Redis/DB here.
     return jsonify({"message": "Logged out successfully."})
 
 
-# ─── TOKEN REFRESH ────────────────────────────────────────────────────
+# ─── TOKEN REFRESH ───────────────────────────────────────────────────
 @auth_bp.route("/refresh", methods=["POST"])
 @jwt_required(refresh=True)
 def refresh():
