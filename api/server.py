@@ -28,6 +28,22 @@ app.register_blueprint(auth_bp)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
 
+logger = logging.getLogger("api")
+
+def run_migrations():
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+            ...
+        """)
+        # ... rest of function
+        logger.info("Migrations complete.")
+
+# Initialize database on startup
+init_db()
+run_migrations()
+
 # Initialize database on startup
 init_db()
 run_migrations()
