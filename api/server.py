@@ -4,7 +4,6 @@ and monitor status to the frontend HTML application.
 """
 import os
 import sys
-import json
 import logging
 
 from flask import Flask, request, jsonify, send_from_directory, redirect
@@ -22,31 +21,77 @@ from db.database import (
 
 app = Flask(__name__, static_folder=STATIC_DIR)
 CORS(app, origins=CORS_ORIGINS)
+
 from api.auth_routes import auth_bp
 app.register_blueprint(auth_bp)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
 
-logger = logging.getLogger("api")
 
 def run_migrations():
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
-            ...
+                id SERIAL PRIMARY KEY,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                plan VARCHAR(50) NOT NULL DEFAULT 'free',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_login TIMESTAMPTZ,
+                notification_email BOOLEAN NOT NULL DEFAULT TRUE,
+                notification_inapp BOOLEAN NOT NULL DEFAULT TRUE,
+                data_retention_days INTEGER NOT NULL DEFAULT 30,
+                alert_email_override VARCHAR(255)
+            )
         """)
-        # ... rest of function
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS saved_searches (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                query TEXT NOT NULL,
+                dataset_filter VARCHAR(255),
+                alert_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_matched_at TIMESTAMPTZ
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                type VARCHAR(50) NOT NULL DEFAULT 'platform',
+                title VARCHAR(120) NOT NULL,
+                body TEXT NOT NULL,
+                read BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_datasets (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name VARCHAR(255) NOT NULL,
+                category VARCHAR(100),
+                description TEXT,
+                status VARCHAR(50) NOT NULL DEFAULT 'pending',
+                file_count INTEGER NOT NULL DEFAULT 0,
+                total_bytes BIGINT NOT NULL DEFAULT 0,
+                s3_prefix VARCHAR(512),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                completed_at TIMESTAMPTZ
+            )
+        """)
+        conn.commit()
+        cur.close()
         logger.info("Migrations complete.")
 
-# Initialize database on startup
-init_db()
-run_migrations()
 
 # Initialize database on startup
 init_db()
 run_migrations()
+
 
 @app.route("/")
 def root():
@@ -57,14 +102,17 @@ def root():
         "stats": "/api/stats"
     })
 
+
 @app.route("/static/<path:path>")
 def serve_static(path):
     return send_from_directory(STATIC_DIR, path)
+
 
 @app.route("/api/stats")
 def api_stats():
     stats = get_stats()
     return jsonify(stats)
+
 
 @app.route("/api/documents")
 def api_documents():
@@ -89,6 +137,7 @@ def api_documents():
         "offset": offset,
     })
 
+
 @app.route("/api/file/<file_id>")
 def api_file_redirect(file_id):
     with get_db() as conn:
@@ -102,6 +151,7 @@ def api_file_redirect(file_id):
     else:
         return jsonify({"error": "File not found"}), 404
 
+
 @app.route("/api/persons")
 def api_persons():
     category = request.args.get("category", "all")
@@ -111,6 +161,7 @@ def api_persons():
 
     persons = get_persons(category=category, search=search, sort=sort, limit=limit)
     return jsonify({"persons": persons, "total": len(persons)})
+
 
 @app.route("/api/persons/<name>/documents")
 def api_person_documents(name):
@@ -133,6 +184,7 @@ def api_person_documents(name):
 
     return jsonify({"documents": docs, "person": name})
 
+
 @app.route("/api/timeline")
 def api_timeline():
     person = request.args.get("person", "all")
@@ -149,6 +201,7 @@ def api_timeline():
     )
     return jsonify({"events": events, "total": len(events)})
 
+
 @app.route("/api/flights")
 def api_flights():
     flights = [
@@ -160,6 +213,7 @@ def api_flights():
         {"from": "Necker Island, BVI", "to": "Little St. James, USVI", "freq": "Documented", "aircraft": "Various", "alias": ""},
     ]
     return jsonify({"flights": flights})
+
 
 @app.route("/api/locations")
 def api_locations():
@@ -175,6 +229,7 @@ def api_locations():
     ]
     return jsonify({"locations": locations})
 
+
 @app.route("/api/datasets")
 def api_datasets():
     datasets = []
@@ -188,11 +243,13 @@ def api_datasets():
         })
     return jsonify({"datasets": datasets})
 
+
 @app.route("/api/monitor")
 def api_monitor():
     limit = min(request.args.get("limit", 50, type=int), 200)
     log = get_monitor_log(limit=limit)
     return jsonify({"log": log, "total": len(log)})
+
 
 @app.route("/api/search")
 def api_search():
@@ -208,6 +265,7 @@ def api_search():
         "persons": persons,
         "timeline_events": events,
     })
+
 
 @app.route("/api/scan-progress")
 def api_scan_progress():
@@ -225,6 +283,7 @@ def api_scan_progress():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/api/pending")
 def api_pending():
     """Check how many URLs are still pending download."""
@@ -234,12 +293,12 @@ def api_pending():
         downloaded = query_val(conn, "SELECT COUNT(*) FROM scraped_urls WHERE downloaded = 1")
     return jsonify({"total_urls": total, "pending": pending, "downloaded": downloaded})
 
+
 @app.route("/api/reset-failed")
 def api_reset_failed():
     """Reset all non-downloaded URLs so the downloader retries them."""
     with get_db() as conn:
         cur = conn.cursor()
-        # Reset URLs that were scraped but never successfully downloaded to S3
         cur.execute("""
             UPDATE scraped_urls SET downloaded = 0
             WHERE downloaded = 1
@@ -249,9 +308,11 @@ def api_reset_failed():
         cur.close()
     return jsonify({"reset": reset_count, "message": f"Reset {reset_count} URLs for retry"})
 
+
 @app.route("/api/health")
 def api_health():
     return jsonify({"status": "ok", "version": "2.1.0"})
+
 
 if __name__ == "__main__":
     logger.info(f"Starting API server on {API_HOST}:{API_PORT}")
