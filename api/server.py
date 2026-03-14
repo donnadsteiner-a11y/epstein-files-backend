@@ -30,6 +30,7 @@ logger = logging.getLogger("api")
 
 # Initialize database on startup
 init_db()
+run_migrations()
 
 @app.route("/")
 def root():
