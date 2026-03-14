@@ -531,6 +531,24 @@ def get_stats():
         last_log = query_one(conn, "SELECT * FROM monitor_log ORDER BY timestamp DESC LIMIT 1")
         recent_new = query_val(conn, "SELECT COALESCE(SUM(new_files),0) FROM monitor_log WHERE timestamp > NOW() - INTERVAL '7 days'")
 
+        # Per-dataset document breakdown
+        dataset_rows = query_rows(conn, """
+            SELECT dataset_id, COUNT(*) AS count
+            FROM documents
+            WHERE dataset_id IS NOT NULL
+            GROUP BY dataset_id
+            ORDER BY dataset_id
+        """)
+
+    dataset_breakdown = [
+        {
+            "id": row["dataset_id"],
+            "label": f"DOJ Data Set {row['dataset_id']}",
+            "count": row["count"]
+        }
+        for row in dataset_rows
+    ]
+
     if last_log and last_log.get("timestamp"):
         last_log["timestamp"] = last_log["timestamp"].isoformat() if hasattr(last_log["timestamp"], "isoformat") else str(last_log["timestamp"])
 
@@ -556,6 +574,7 @@ def get_stats():
 
         "new_files_this_week": recent_new,
         "last_check": last_log,
+        "datasets_breakdown": dataset_breakdown,
     }
 
 
