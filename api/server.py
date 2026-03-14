@@ -8,6 +8,7 @@ import logging
 
 from flask import Flask, request, jsonify, send_from_directory, redirect
 from flask_cors import CORS
+from flask_jwt_extended import JWTManager
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import (
@@ -21,6 +22,9 @@ from db.database import (
 
 app = Flask(__name__, static_folder=STATIC_DIR)
 CORS(app, origins=CORS_ORIGINS)
+
+app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "dev-key-change-me")
+JWTManager(app)
 
 from api.auth_routes import auth_bp
 app.register_blueprint(auth_bp)
