@@ -2,6 +2,14 @@
 api/auth_routes.py — DocketZero Authentication Blueprint
 """
 
+import os
+import re
+import smtplib
+import logging
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from datetime import timedelta
+
 from flask import Blueprint, request, jsonify
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -13,16 +21,15 @@ from flask_jwt_extended import (
 )
 import psycopg2
 import psycopg2.errors
-import os
-import re
-from datetime import timedelta
+
+logger = logging.getLogger("api")
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 CORS(auth_bp, origins=["https://docketzero.com", "http://docketzero.com", "http://localhost"])
 
+
 # ─── DB ──────────────────────────────────────────────────────────────
 def get_db():
-    """Return a new psycopg2 connection using the Render internal DATABASE_URL."""
     return psycopg2.connect(os.environ["DATABASE_URL"])
 
 
@@ -34,6 +41,101 @@ def valid_email(email: str) -> bool:
 
 def fmt_dt(dt):
     return dt.isoformat() if dt else None
+
+
+# ─── EMAIL ───────────────────────────────────────────────────────────
+def send_welcome_email(to_email: str):
+    try:
+        smtp_host = os.environ.get("SMTP_HOST", "mail.docketzero.com")
+        smtp_port = int(os.environ.get("SMTP_PORT", 587))
+        smtp_user = os.environ.get("SMTP_USER", "support@docketzero.com")
+        smtp_pass = os.environ.get("SMTP_PASS", "")
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "Welcome to DocketZero"
+        msg["From"] = f"DocketZero <{smtp_user}>"
+        msg["To"] = to_email
+
+        text = f"""Welcome to DocketZero.
+
+Your account has been created and you now have free access to:
+- The Epstein Files (6,788 documents)
+- Panama Papers (coming soon)
+- Entity search, timelines, and relationship views
+
+Sign in at any time: https://docketzero.com/login.html
+
+If you have questions, reply to this email.
+
+— The DocketZero Team
+"""
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  body {{ margin:0; padding:0; background:#eef3f8; font-family:Inter,Arial,sans-serif; }}
+  .wrap {{ max-width:560px; margin:40px auto; background:#ffffff; border:1px solid #dbe4ec; border-radius:16px; overflow:hidden; }}
+  .header {{ background:linear-gradient(180deg,#edf3f8 0%,#e3ebf3 100%); padding:28px 32px; border-bottom:1px solid #cad6e2; }}
+  .header img {{ height:48px; }}
+  .header-title {{ font-size:22px; font-weight:800; color:#0f1720; margin-top:10px; }}
+  .header-title span {{ color:#c99a3c; }}
+  .body {{ padding:32px; }}
+  .body p {{ font-size:15px; color:#5f7387; line-height:1.7; margin:0 0 16px; }}
+  .body strong {{ color:#0f1720; }}
+  .features {{ background:#f5f8fb; border:1px solid #dbe4ec; border-radius:12px; padding:18px 20px; margin:20px 0; }}
+  .feature {{ display:flex; align-items:flex-start; gap:10px; margin-bottom:10px; font-size:14px; color:#0f1720; }}
+  .feature:last-child {{ margin-bottom:0; }}
+  .check {{ color:#2f8f53; font-weight:700; }}
+  .cta {{ display:block; text-align:center; margin:24px 0 8px; padding:14px 24px; background:#c99a3c; color:#ffffff; text-decoration:none; border-radius:10px; font-size:15px; font-weight:700; }}
+  .footer {{ padding:20px 32px; border-top:1px solid #dbe4ec; font-size:12px; color:#5f7387; text-align:center; line-height:1.6; }}
+  .footer a {{ color:#5f7387; }}
+  .notice {{ margin:20px 0 0; padding:14px 16px; background:#fff8f0; border:1px solid #f0d9b8; border-left:3px solid #c99a3c; border-radius:10px; font-size:13px; color:#5f7387; line-height:1.6; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <div class="header-title">DocketZero<span>.</span></div>
+    <div style="font-size:13px;color:#5f7387;margin-top:4px">Evidence-first research platform</div>
+  </div>
+  <div class="body">
+    <p>Your account is confirmed. Welcome to DocketZero.</p>
+    <p>You now have <strong>free access</strong> to the following archives:</p>
+    <div class="features">
+      <div class="feature"><span class="check">✓</span> Epstein Files — 6,788 documents from DOJ / EFTA releases</div>
+      <div class="feature"><span class="check">✓</span> Panama Papers — coming soon</div>
+      <div class="feature"><span class="check">✓</span> Entity search, timelines &amp; relationship views</div>
+      <div class="feature"><span class="check">✓</span> Saved searches with alert notifications</div>
+    </div>
+    <a class="cta" href="https://docketzero.com/dashboard.html">Go to My Dashboard →</a>
+    <div class="notice">
+      <strong style="color:#0f1720">Reminder:</strong> DocketZero is a public research platform. Do not submit personally identifiable information (PII). Your account data is never sold or shared.
+    </div>
+  </div>
+  <div class="footer">
+    © 2026 DocketZero &nbsp;·&nbsp; <a href="https://docketzero.com">docketzero.com</a><br>
+    Questions? Reply to this email or contact <a href="mailto:support@docketzero.com">support@docketzero.com</a>
+  </div>
+</div>
+</body>
+</html>"""
+
+        msg.attach(MIMEText(text, "plain"))
+        msg.attach(MIMEText(html, "html"))
+
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, to_email, msg.as_string())
+
+        logger.info(f"Welcome email sent to {to_email}")
+
+    except Exception as e:
+        # Non-critical — log but don't fail the registration
+        logger.warning(f"Failed to send welcome email to {to_email}: {e}")
 
 
 # ─── REGISTER ────────────────────────────────────────────────────────
@@ -76,6 +178,9 @@ def register():
     refresh_token = create_refresh_token(
         identity=str(user_id), expires_delta=timedelta(days=30)
     )
+
+    # Send welcome email (non-blocking — failure won't affect registration)
+    send_welcome_email(email)
 
     return jsonify(
         {
@@ -120,7 +225,7 @@ def login():
         cur.close()
         conn.close()
     except Exception:
-        pass  # Non-critical — login still succeeds
+        pass
 
     access_token = create_access_token(
         identity=str(row[0]), expires_delta=timedelta(hours=24)
