@@ -22,6 +22,8 @@ from db.database import (
 
 app = Flask(__name__, static_folder=STATIC_DIR)
 CORS(app, origins=CORS_ORIGINS)
+from auth_routes import auth_bp
+app.register_blueprint(auth_bp)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
