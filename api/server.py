@@ -50,6 +50,15 @@ def run_migrations():
                 alert_email_override VARCHAR(255)
             )
         """)
+
+        for col_sql in [
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(100) DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name  VARCHAR(100) DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS age_verified        BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS disclaimer_accepted BOOLEAN NOT NULL DEFAULT FALSE",
+]:
+    cur.execute(col_sql)
+        
         cur.execute("""
             CREATE TABLE IF NOT EXISTS saved_searches (
                 id SERIAL PRIMARY KEY,
