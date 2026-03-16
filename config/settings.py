@@ -16,8 +16,6 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # ─── DREAMOBJECTS (S3-COMPATIBLE) ───────────────────────────────────────────
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "https://s3.us-east-005.dream.io")
-S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "005c4b661355d0b0000000004")
-S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "K0050WRjQdtF4EfO0/NWsxkrwZ52/lQ")
 S3_BUCKET = os.environ.get("S3_BUCKET", "docketzero-files")
 S3_PUBLIC_URL = f"{S3_ENDPOINT}/{S3_BUCKET}"
 
