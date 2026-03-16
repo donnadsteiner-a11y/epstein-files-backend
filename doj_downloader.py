@@ -2,18 +2,23 @@
 """
 doj_downloader.py
 =================
-Generic DOJ dataset downloader. Handles any dataset by passing
-DATASET_NUMBER as an environment variable.
+Generic DOJ dataset downloader with Kino fallback.
 
-Two-source approach:
-  1. rhowardstone corpus — bulk of known verified files
-  2. DOJ listing page scrape — catches new files added after corpus
+Download strategy for each EFTA file:
+  1. Try DOJ directly (freshest source, includes newest files)
+  2. If DOJ returns 404 or blocks → try assets.getkino.com
+     (1,401,320 files including DOJ-deleted documents)
+  3. If both fail → log as failed for next run
+
+Two-source URL discovery:
+  1. rhowardstone corpus — verified EFTA numbers
+  2. DOJ listing page 0 scrape — catches new files
 
 Uploads to: docketzero-files/Data Set {N}/EFTA########.pdf
 
 Fully resumable — files already in DreamObjects are skipped.
 
-Required environment variables:
+Required environment variables (GitHub Secrets):
     DATASET_NUMBER   Which dataset to download (1-12)
     DOJ_COOKIES      Browser cookie string
     DO_ENDPOINT      https://s3.us-east-005.dream.io
@@ -37,8 +42,6 @@ from botocore.config import Config
 from bs4 import BeautifulSoup
 
 # ── Dataset registry ───────────────────────────────────────────────────────────
-# EFTA ranges from rhowardstone/Epstein-research-data efta_dataset_mapping
-# URL template uses %20 encoding for spaces in dataset folder names
 
 DATASETS = {
     1:  {"start": 1,        "end": 3158,    "url_folder": "DataSet%201"},
@@ -52,13 +55,16 @@ DATASETS = {
     9:  {"start": 39025,    "end": 1262781, "url_folder": "DataSet%209"},
     10: {"start": 1262782,  "end": 2205654, "url_folder": "DataSet%2010"},
     11: {"start": 2205655,  "end": 2730264, "url_folder": "DataSet%2011"},
-    12: {"start": 2730265,  "end": 2731783, "url_folder": "DataSet%2012"},
+    12: {"start": 2730265,  "end": 2858497, "url_folder": "DataSet%2012"},
 }
 
 CORPUS_URL = (
     "https://raw.githubusercontent.com/rhowardstone/"
     "Epstein-research-data/main/document_summary.csv.gz"
 )
+
+# Kino mirror — 1,401,320 files including DOJ-deleted documents
+KINO_URL = "https://assets.getkino.com/documents/EFTA{efta}.pdf"
 
 # ── Environment ────────────────────────────────────────────────────────────────
 
@@ -92,7 +98,16 @@ DOJ_HEADERS = {
     "Referer":         DOJ_LISTING,
 }
 
-DELAY_BETWEEN  = 1.2
+KINO_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/pdf,*/*",
+}
+
+DELAY_BETWEEN  = 1.0
 DELAY_ON_ERROR = 10.0
 
 
@@ -131,7 +146,7 @@ def fetch_corpus_eftas() -> set:
 
     eftas = set()
     with gzip.open(io.BytesIO(resp.content), "rt", encoding="utf-8") as f:
-        header  = None
+        header   = None
         efta_col = 0
         for line in f:
             line = line.rstrip("\n")
@@ -168,7 +183,6 @@ def scrape_listing_eftas(session: requests.Session) -> set:
     while True:
         url = DOJ_LISTING if page_num == 0 else f"{DOJ_LISTING}?page={page_num}"
         print(f"    Page {page_num}: {url}")
-
         try:
             resp = session.get(url, timeout=30)
         except requests.RequestException as exc:
@@ -184,7 +198,6 @@ def scrape_listing_eftas(session: requests.Session) -> set:
             break
 
         soup = BeautifulSoup(resp.text, "html.parser")
-
         page_eftas = set()
         for tag in soup.find_all("a", href=True):
             href = tag["href"]
@@ -196,9 +209,7 @@ def scrape_listing_eftas(session: requests.Session) -> set:
                 page_eftas.add(f"{efta_int:08d}")
 
         print(f"    Found {len(page_eftas)} PDFs on page {page_num}")
-
         if not page_eftas:
-            print(f"    No PDFs — pagination complete")
             break
 
         eftas.update(page_eftas)
@@ -250,6 +261,51 @@ def upload(s3, key: str, data: bytes) -> bool:
         return False
 
 
+# ── Download: try DOJ then Kino ────────────────────────────────────────────────
+
+def download_pdf(efta: str, doj_session: requests.Session,
+                 kino_session: requests.Session) -> tuple[bytes | None, str]:
+    """
+    Try DOJ first, then Kino mirror.
+    Returns (pdf_bytes, source) or (None, reason).
+    """
+    doj_url  = DOJ_URL.format(efta=efta)
+    kino_url = KINO_URL.format(efta=efta)
+
+    # ── Attempt 1: DOJ ────────────────────────────────────────────────────────
+    try:
+        resp = doj_session.get(doj_url, timeout=60)
+
+        if resp.status_code == 200:
+            ctype = resp.headers.get("Content-Type", "")
+            if "html" not in ctype.lower() and len(resp.content) >= 512:
+                return resp.content, "DOJ"
+
+        if resp.status_code not in (404, 403, 401):
+            # Unexpected status — still try Kino
+            pass
+
+    except requests.RequestException:
+        pass  # fall through to Kino
+
+    # ── Attempt 2: Kino mirror ────────────────────────────────────────────────
+    try:
+        resp = kino_session.get(kino_url, timeout=60)
+
+        if resp.status_code == 200:
+            ctype = resp.headers.get("Content-Type", "")
+            if "html" not in ctype.lower() and len(resp.content) >= 512:
+                return resp.content, "Kino"
+
+        if resp.status_code == 404:
+            return None, "404-both"
+
+    except requests.RequestException as exc:
+        return None, f"error:{exc}"
+
+    return None, "failed"
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -259,7 +315,7 @@ def main():
     print(f"  Bucket      : {DO_BUCKET}")
     print(f"  Prefix      : {S3_PREFIX}/")
     print(f"  EFTA range  : {EFTA_START:08d} → {EFTA_END:08d}")
-    print(f"  Listing URL : {DOJ_LISTING}")
+    print(f"  Sources     : DOJ → Kino fallback")
     print("=" * 60)
 
     cookies = parse_cookies(DOJ_COOKIES_RAW)
@@ -268,13 +324,19 @@ def main():
         sys.exit(1)
     print(f"\n  Cookies loaded: {list(cookies.keys())}\n")
 
-    session = requests.Session()
-    session.headers.update(DOJ_HEADERS)
-    session.cookies.update(cookies)
+    # DOJ session (with cookies)
+    doj_session = requests.Session()
+    doj_session.headers.update(DOJ_HEADERS)
+    doj_session.cookies.update(cookies)
 
+    # Kino session (no auth needed)
+    kino_session = requests.Session()
+    kino_session.headers.update(KINO_HEADERS)
+
+    # Gather EFTA numbers
     corpus_eftas  = fetch_corpus_eftas()
     print()
-    listing_eftas = scrape_listing_eftas(session)
+    listing_eftas = scrape_listing_eftas(doj_session)
     print()
 
     all_eftas = sorted(corpus_eftas | listing_eftas)
@@ -287,19 +349,22 @@ def main():
         print("ERROR: No EFTA numbers found from either source.")
         sys.exit(1)
 
+    # S3 skip-list
     s3       = build_s3()
     uploaded = fetch_uploaded_keys(s3)
 
+    # Download + upload loop
     uploaded_count = 0
     skipped_count  = 0
+    doj_count      = 0
+    kino_count     = 0
     failed         = []
 
-    print(f"\n── Downloading {total:,} PDFs ─────────────────────────────\n")
+    print(f"\n── Downloading {total:,} PDFs (DOJ → Kino fallback) ──────────\n")
 
     for idx, efta in enumerate(all_eftas, 1):
         filename = f"EFTA{efta}.pdf"
         s3_key   = f"{S3_PREFIX}/{filename}"
-        url      = DOJ_URL.format(efta=efta)
 
         if s3_key in uploaded:
             skipped_count += 1
@@ -307,51 +372,35 @@ def main():
 
         print(f"  [{idx}/{total}]  {filename}", end="  ", flush=True)
 
-        try:
-            resp = session.get(url, timeout=60)
-        except requests.RequestException as exc:
-            print(f"✗  Request error: {exc}")
-            failed.append(efta)
-            time.sleep(DELAY_ON_ERROR)
-            continue
+        pdf_bytes, source = download_pdf(efta, doj_session, kino_session)
 
-        if resp.status_code == 404:
-            print(f"✗  404 (not found)")
+        if pdf_bytes is None:
+            print(f"✗  Not found ({source})")
+            if source != "404-both":
+                failed.append(efta)
             time.sleep(DELAY_BETWEEN)
-            continue
-
-        if resp.status_code != 200:
-            print(f"✗  HTTP {resp.status_code}")
-            failed.append(efta)
-            time.sleep(DELAY_ON_ERROR)
-            continue
-
-        ctype = resp.headers.get("Content-Type", "")
-        if "html" in ctype.lower():
-            print(f"✗  Got HTML — cookies expired. Stopping.")
-            print("   Update DOJ_COOKIES secret and re-run.")
-            print(f"   Stopped at EFTA {efta} ({idx}/{total})")
-            sys.exit(2)
-
-        pdf_bytes = resp.content
-        if len(pdf_bytes) < 512:
-            print(f"✗  Too small ({len(pdf_bytes)} bytes) — skipping")
-            failed.append(efta)
             continue
 
         ok = upload(s3, s3_key, pdf_bytes)
         if ok:
             uploaded_count += 1
             uploaded.add(s3_key)
-            print(f"✓  {len(pdf_bytes):,} bytes")
+            if source == "DOJ":
+                doj_count += 1
+            else:
+                kino_count += 1
+            print(f"✓  {len(pdf_bytes):,} bytes  [{source}]")
         else:
             failed.append(efta)
 
         time.sleep(DELAY_BETWEEN)
 
+    # Summary
     print("\n" + "=" * 60)
     print(f"  Run complete — DS{DATASET_NUMBER}")
     print(f"  Uploaded this run : {uploaded_count:,}")
+    print(f"    from DOJ        : {doj_count:,}")
+    print(f"    from Kino       : {kino_count:,}")
     print(f"  Skipped (done)    : {skipped_count:,}")
     print(f"  Failed            : {len(failed):,}")
     print("=" * 60)
