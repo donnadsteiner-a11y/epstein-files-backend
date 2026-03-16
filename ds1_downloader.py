@@ -2,39 +2,47 @@
 """
 ds1_downloader.py
 =================
-Downloads all Dataset 1 PDFs from DOJ using the known EFTA number range
-and uploads each one to DreamObjects under:
+Downloads all Dataset 1 PDFs using a two-source approach:
 
-    docketzero-files/Data Set 1/EFTA00000001.pdf
+  1. rhowardstone corpus (document_summary.csv.gz) — bulk of known files
+  2. Page 0 scrape of the DOJ DS1 listing — catches new files added
+     after the corpus was last updated
 
-EFTA range: 00000001 → 00003158 (3,158 files)
+Both sources are deduplicated before downloading.
+Uploads to: docketzero-files/Data Set 1/EFTA00000001.pdf
 
-Fully resumable — files already in DreamObjects are skipped on every run.
+Fully resumable — files already in DreamObjects are skipped.
 
-Required environment variables (GitHub Secrets):
-    DOJ_COOKIES      Cookie string copied from your browser
-    DO_ENDPOINT      https://s3.us-east-005.dream.io
-    DO_ACCESS_KEY    DreamObjects access key
-    DO_SECRET_KEY    DreamObjects secret key
-    DO_BUCKET        docketzero-files
+Required GitHub Secrets:
+    DOJ_COOKIES, DO_ENDPOINT, DO_ACCESS_KEY, DO_SECRET_KEY, DO_BUCKET
 """
 
+import gzip
+import io
 import json
 import os
+import re
 import sys
 import time
 
 import boto3
 import requests
 from botocore.config import Config
+from bs4 import BeautifulSoup
 
 # ── Dataset config ─────────────────────────────────────────────────────────────
 
-DATASET_NUMBER = 1
-EFTA_START     = 1
-EFTA_END       = 3158
-S3_PREFIX      = "Data Set 1"
-DOJ_URL        = "https://www.justice.gov/epstein/files/DataSet%201/EFTA{efta}.pdf"
+DATASET_NUMBER   = 1
+EFTA_RANGE_START = 1
+EFTA_RANGE_END   = 3158
+S3_PREFIX        = "Data Set 1"
+DOJ_LISTING      = "https://www.justice.gov/epstein/doj-disclosures/data-set-1-files"
+DOJ_URL_TEMPLATE = "https://www.justice.gov/epstein/files/DataSet%201/EFTA{efta}.pdf"
+
+CORPUS_URL = (
+    "https://raw.githubusercontent.com/rhowardstone/"
+    "Epstein-research-data/main/document_summary.csv.gz"
+)
 
 # ── Environment ────────────────────────────────────────────────────────────────
 
@@ -44,15 +52,15 @@ DO_SECRET_KEY   = os.environ["DO_SECRET_KEY"]
 DO_BUCKET       = os.environ["DO_BUCKET"]
 DOJ_COOKIES_RAW = os.environ["DOJ_COOKIES"]
 
-HEADERS = {
+DOJ_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept":          "application/pdf,*/*",
+    "Accept":          "text/html,application/pdf,*/*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer":         "https://www.justice.gov/epstein/doj-disclosures/data-set-1-files",
+    "Referer":         DOJ_LISTING,
 }
 
 DELAY_BETWEEN  = 1.2
@@ -77,7 +85,102 @@ def parse_cookies(raw: str) -> dict:
     return cookies
 
 
-# ── S3 client ──────────────────────────────────────────────────────────────────
+# ── Source 1: rhowardstone corpus ─────────────────────────────────────────────
+
+def fetch_corpus_eftas() -> set:
+    print("  [Source 1] Downloading rhowardstone corpus ...")
+    try:
+        resp = requests.get(CORPUS_URL, timeout=120)
+        if resp.status_code != 200:
+            print(f"  WARNING: Corpus HTTP {resp.status_code} — skipping")
+            return set()
+    except Exception as exc:
+        print(f"  WARNING: Corpus error ({exc}) — skipping")
+        return set()
+
+    print(f"  Downloaded {len(resp.content):,} bytes — parsing ...")
+
+    eftas = set()
+    with gzip.open(io.BytesIO(resp.content), "rt", encoding="utf-8") as f:
+        header = None
+        efta_col = 0
+        for line in f:
+            line = line.rstrip("\n")
+            if header is None:
+                header = line.split(",")
+                try:
+                    efta_col = header.index("efta_number")
+                except ValueError:
+                    efta_col = 0
+                continue
+            parts = line.split(",")
+            if len(parts) <= efta_col:
+                continue
+            efta = parts[efta_col].strip().strip('"')
+            try:
+                efta_clean = efta.upper().replace("EFTA", "").strip()
+                efta_int   = int(efta_clean)
+                if EFTA_RANGE_START <= efta_int <= EFTA_RANGE_END:
+                    eftas.add(f"{efta_int:08d}")
+            except ValueError:
+                continue
+
+    print(f"  Found {len(eftas):,} EFTA numbers from corpus")
+    return eftas
+
+
+# ── Source 2: DOJ listing scraper ─────────────────────────────────────────────
+
+def scrape_listing_eftas(session: requests.Session) -> set:
+    print("  [Source 2] Scraping DOJ DS1 listing pages ...")
+    eftas    = set()
+    page_num = 0
+
+    while True:
+        url = DOJ_LISTING if page_num == 0 else f"{DOJ_LISTING}?page={page_num}"
+        print(f"    Page {page_num}: {url}")
+
+        try:
+            resp = session.get(url, timeout=30)
+        except requests.RequestException as exc:
+            print(f"    Request error: {exc} — stopping")
+            break
+
+        if resp.status_code not in (200, 304):
+            print(f"    HTTP {resp.status_code} — stopping pagination")
+            break
+
+        if "Access Denied" in resp.text and len(resp.text) < 3000:
+            print(f"    Access Denied — stopping pagination")
+            break
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        page_eftas = set()
+        for tag in soup.find_all("a", href=True):
+            href = tag["href"]
+            if not href.lower().endswith(".pdf"):
+                continue
+            match = re.search(r"EFTA(\d+)", href, re.IGNORECASE)
+            if match:
+                efta_int = int(match.group(1))
+                page_eftas.add(f"{efta_int:08d}")
+
+        print(f"    Found {len(page_eftas)} PDFs on page {page_num}")
+
+        if not page_eftas:
+            print(f"    No PDFs found — pagination complete")
+            break
+
+        eftas.update(page_eftas)
+        page_num += 1
+        time.sleep(1.5)
+
+    print(f"  Found {len(eftas):,} EFTA numbers from listing scrape")
+    return eftas
+
+
+# ── S3 helpers ─────────────────────────────────────────────────────────────────
 
 def build_s3():
     return boto3.client(
@@ -121,15 +224,11 @@ def upload(s3, key: str, data: bytes) -> bool:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    total_files = EFTA_END - EFTA_START + 1
-
     print("=" * 60)
     print(f"  DocketZero — Dataset {DATASET_NUMBER} Downloader")
     print("=" * 60)
-    print(f"  Bucket     : {DO_BUCKET}")
-    print(f"  Prefix     : {S3_PREFIX}/")
-    print(f"  EFTA range : {EFTA_START:08d} → {EFTA_END:08d}")
-    print(f"  Total files: {total_files:,}")
+    print(f"  Bucket  : {DO_BUCKET}")
+    print(f"  Prefix  : {S3_PREFIX}/")
     print("=" * 60)
 
     cookies = parse_cookies(DOJ_COOKIES_RAW)
@@ -139,36 +238,52 @@ def main():
     print(f"\n  Cookies loaded: {list(cookies.keys())}\n")
 
     session = requests.Session()
-    session.headers.update(HEADERS)
+    session.headers.update(DOJ_HEADERS)
     session.cookies.update(cookies)
 
-    s3 = build_s3()
+    # ── Gather EFTA numbers from both sources ──────────────────────────────────
+    corpus_eftas  = fetch_corpus_eftas()
+    print()
+    listing_eftas = scrape_listing_eftas(session)
+    print()
+
+    all_eftas = sorted(corpus_eftas | listing_eftas)
+    total     = len(all_eftas)
+
+    print(f"  Combined unique EFTA numbers : {total:,}")
+    print(f"  (corpus: {len(corpus_eftas):,}  |  listing-only new: {len(listing_eftas - corpus_eftas):,})")
+
+    if total == 0:
+        print("ERROR: No EFTA numbers found from either source.")
+        sys.exit(1)
+
+    # ── Build S3 skip-list ─────────────────────────────────────────────────────
+    s3       = build_s3()
     uploaded = fetch_uploaded_keys(s3)
 
+    # ── Download loop ──────────────────────────────────────────────────────────
     uploaded_count = 0
     skipped_count  = 0
     failed         = []
 
-    print(f"\n── Downloading {total_files:,} PDFs ─────────────────────────────\n")
+    print(f"\n── Downloading {total:,} PDFs ─────────────────────────────\n")
 
-    for efta_int in range(EFTA_START, EFTA_END + 1):
-        efta_str = f"{efta_int:08d}"
-        filename = f"EFTA{efta_str}.pdf"
+    for idx, efta in enumerate(all_eftas, 1):
+        filename = f"EFTA{efta}.pdf"
         s3_key   = f"{S3_PREFIX}/{filename}"
-        url      = DOJ_URL.format(efta=efta_str)
-        idx      = efta_int - EFTA_START + 1
+        url      = DOJ_URL_TEMPLATE.format(efta=efta)
 
         if s3_key in uploaded:
             skipped_count += 1
             continue
 
-        print(f"  [{idx}/{total_files}]  {filename}", end="  ", flush=True)
+        print(f"  [{idx}/{total}]  {filename}", end="  ", flush=True)
 
         try:
             resp = session.get(url, timeout=60)
         except requests.RequestException as exc:
             print(f"✗  Request error: {exc}")
-            failed.append(efta_str)
+            failed.append(efta)
             time.sleep(DELAY_ON_ERROR)
             continue
 
@@ -179,7 +294,7 @@ def main():
 
         if resp.status_code != 200:
             print(f"✗  HTTP {resp.status_code}")
-            failed.append(efta_str)
+            failed.append(efta)
             time.sleep(DELAY_ON_ERROR)
             continue
 
@@ -187,13 +302,13 @@ def main():
         if "html" in ctype.lower():
             print(f"✗  Got HTML — cookies may have expired. Stopping.")
             print("   Update DOJ_COOKIES secret and re-run.")
-            print(f"   Stopped at EFTA {efta_str} ({idx}/{total_files})")
+            print(f"   Stopped at EFTA {efta} ({idx}/{total})")
             sys.exit(2)
 
         pdf_bytes = resp.content
         if len(pdf_bytes) < 512:
             print(f"✗  Too small ({len(pdf_bytes)} bytes) — skipping")
-            failed.append(efta_str)
+            failed.append(efta)
             continue
 
         ok = upload(s3, s3_key, pdf_bytes)
@@ -202,10 +317,11 @@ def main():
             uploaded.add(s3_key)
             print(f"✓  {len(pdf_bytes):,} bytes")
         else:
-            failed.append(efta_str)
+            failed.append(efta)
 
         time.sleep(DELAY_BETWEEN)
 
+    # ── Summary ────────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print(f"  Run complete")
     print(f"  Uploaded this run : {uploaded_count:,}")
