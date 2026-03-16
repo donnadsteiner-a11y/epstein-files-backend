@@ -2,47 +2,46 @@ name: Kino Bulk — Large Datasets (DS9, DS10, DS11)
 
 on:
   schedule:
-    - cron: "30 */4 * * *"   # offset from main downloader by 30 min
+    - cron: "30 */4 * * *"
   workflow_dispatch:
 
 jobs:
 
-  # ── Dataset 9: EFTA 00039025 → 01262781 (531,284 files) ──────────────────
   ds9:
-    name: "DS9 slice ${{ matrix.slice }}"
+    name: "DS9-${{ matrix.slice }}"
     runs-on: ubuntu-latest
     timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
         include:
-          - slice: "01"  start: "39025"    end: "92000"
-          - slice: "02"  start: "92001"    end: "145000"
-          - slice: "03"  start: "145001"   end: "198000"
-          - slice: "04"  start: "198001"   end: "251000"
-          - slice: "05"  start: "251001"   end: "304000"
-          - slice: "06"  start: "304001"   end: "357000"
-          - slice: "07"  start: "357001"   end: "410000"
-          - slice: "08"  start: "410001"   end: "463000"
-          - slice: "09"  start: "463001"   end: "516000"
-          - slice: "10"  start: "516001"   end: "570000"
-          - slice: "11"  start: "570001"   end: "623000"
-          - slice: "12"  start: "623001"   end: "676000"
-          - slice: "13"  start: "676001"   end: "729000"
-          - slice: "14"  start: "729001"   end: "782000"
-          - slice: "15"  start: "782001"   end: "835000"
-          - slice: "16"  start: "835001"   end: "888000"
-          - slice: "17"  start: "888001"   end: "941000"
-          - slice: "18"  start: "941001"   end: "994000"
-          - slice: "19"  start: "994001"   end: "1047000"
-          - slice: "20"  start: "1047001"  end: "1262781"
+          - { slice: "01", start: "39025",   end: "92000"   }
+          - { slice: "02", start: "92001",   end: "145000"  }
+          - { slice: "03", start: "145001",  end: "198000"  }
+          - { slice: "04", start: "198001",  end: "251000"  }
+          - { slice: "05", start: "251001",  end: "304000"  }
+          - { slice: "06", start: "304001",  end: "357000"  }
+          - { slice: "07", start: "357001",  end: "410000"  }
+          - { slice: "08", start: "410001",  end: "463000"  }
+          - { slice: "09", start: "463001",  end: "516000"  }
+          - { slice: "10", start: "516001",  end: "570000"  }
+          - { slice: "11", start: "570001",  end: "623000"  }
+          - { slice: "12", start: "623001",  end: "676000"  }
+          - { slice: "13", start: "676001",  end: "729000"  }
+          - { slice: "14", start: "729001",  end: "782000"  }
+          - { slice: "15", start: "782001",  end: "835000"  }
+          - { slice: "16", start: "835001",  end: "888000"  }
+          - { slice: "17", start: "888001",  end: "941000"  }
+          - { slice: "18", start: "941001",  end: "994000"  }
+          - { slice: "19", start: "994001",  end: "1047000" }
+          - { slice: "20", start: "1047001", end: "1262781" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install requests boto3 botocore
-      - name: Download DS9 slice ${{ matrix.slice }}
+      - name: DS9 slice ${{ matrix.slice }}
         env:
           DATASET_NUMBER: "9"
           SLICE_START:    ${{ matrix.start }}
@@ -53,42 +52,41 @@ jobs:
           DO_BUCKET:      ${{ secrets.DO_BUCKET }}
         run: python kino_bulk_downloader.py
 
-  # ── Dataset 10: EFTA 01262782 → 02205654 (942,873 files) ─────────────────
   ds10:
-    name: "DS10 slice ${{ matrix.slice }}"
+    name: "DS10-${{ matrix.slice }}"
     runs-on: ubuntu-latest
     timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
         include:
-          - slice: "01"  start: "1262782"  end: "1309000"
-          - slice: "02"  start: "1309001"  end: "1356000"
-          - slice: "03"  start: "1356001"  end: "1403000"
-          - slice: "04"  start: "1403001"  end: "1450000"
-          - slice: "05"  start: "1450001"  end: "1497000"
-          - slice: "06"  start: "1497001"  end: "1544000"
-          - slice: "07"  start: "1544001"  end: "1591000"
-          - slice: "08"  start: "1591001"  end: "1638000"
-          - slice: "09"  start: "1638001"  end: "1685000"
-          - slice: "10"  start: "1685001"  end: "1732000"
-          - slice: "11"  start: "1732001"  end: "1779000"
-          - slice: "12"  start: "1779001"  end: "1826000"
-          - slice: "13"  start: "1826001"  end: "1873000"
-          - slice: "14"  start: "1873001"  end: "1920000"
-          - slice: "15"  start: "1920001"  end: "1967000"
-          - slice: "16"  start: "1967001"  end: "2014000"
-          - slice: "17"  start: "2014001"  end: "2061000"
-          - slice: "18"  start: "2061001"  end: "2108000"
-          - slice: "19"  start: "2108001"  end: "2155000"
-          - slice: "20"  start: "2155001"  end: "2205654"
+          - { slice: "01", start: "1262782", end: "1309000" }
+          - { slice: "02", start: "1309001", end: "1356000" }
+          - { slice: "03", start: "1356001", end: "1403000" }
+          - { slice: "04", start: "1403001", end: "1450000" }
+          - { slice: "05", start: "1450001", end: "1497000" }
+          - { slice: "06", start: "1497001", end: "1544000" }
+          - { slice: "07", start: "1544001", end: "1591000" }
+          - { slice: "08", start: "1591001", end: "1638000" }
+          - { slice: "09", start: "1638001", end: "1685000" }
+          - { slice: "10", start: "1685001", end: "1732000" }
+          - { slice: "11", start: "1732001", end: "1779000" }
+          - { slice: "12", start: "1779001", end: "1826000" }
+          - { slice: "13", start: "1826001", end: "1873000" }
+          - { slice: "14", start: "1873001", end: "1920000" }
+          - { slice: "15", start: "1920001", end: "1967000" }
+          - { slice: "16", start: "1967001", end: "2014000" }
+          - { slice: "17", start: "2014001", end: "2061000" }
+          - { slice: "18", start: "2061001", end: "2108000" }
+          - { slice: "19", start: "2108001", end: "2155000" }
+          - { slice: "20", start: "2155001", end: "2205654" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install requests boto3 botocore
-      - name: Download DS10 slice ${{ matrix.slice }}
+      - name: DS10 slice ${{ matrix.slice }}
         env:
           DATASET_NUMBER: "10"
           SLICE_START:    ${{ matrix.start }}
@@ -99,42 +97,41 @@ jobs:
           DO_BUCKET:      ${{ secrets.DO_BUCKET }}
         run: python kino_bulk_downloader.py
 
-  # ── Dataset 11: EFTA 02205655 → 02730264 (524,610 files) ─────────────────
   ds11:
-    name: "DS11 slice ${{ matrix.slice }}"
+    name: "DS11-${{ matrix.slice }}"
     runs-on: ubuntu-latest
     timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
         include:
-          - slice: "01"  start: "2205655"  end: "2231895"
-          - slice: "02"  start: "2231896"  end: "2258136"
-          - slice: "03"  start: "2258137"  end: "2284377"
-          - slice: "04"  start: "2284378"  end: "2310618"
-          - slice: "05"  start: "2310619"  end: "2336859"
-          - slice: "06"  start: "2336860"  end: "2363100"
-          - slice: "07"  start: "2363101"  end: "2389341"
-          - slice: "08"  start: "2389342"  end: "2415582"
-          - slice: "09"  start: "2415583"  end: "2441823"
-          - slice: "10"  start: "2441824"  end: "2468064"
-          - slice: "11"  start: "2468065"  end: "2494305"
-          - slice: "12"  start: "2494306"  end: "2520546"
-          - slice: "13"  start: "2520547"  end: "2546787"
-          - slice: "14"  start: "2546788"  end: "2573028"
-          - slice: "15"  start: "2573029"  end: "2599269"
-          - slice: "16"  start: "2599270"  end: "2625510"
-          - slice: "17"  start: "2625511"  end: "2651751"
-          - slice: "18"  start: "2651752"  end: "2677992"
-          - slice: "19"  start: "2677993"  end: "2704233"
-          - slice: "20"  start: "2704234"  end: "2730264"
+          - { slice: "01", start: "2205655", end: "2231895" }
+          - { slice: "02", start: "2231896", end: "2258136" }
+          - { slice: "03", start: "2258137", end: "2284377" }
+          - { slice: "04", start: "2284378", end: "2310618" }
+          - { slice: "05", start: "2310619", end: "2336859" }
+          - { slice: "06", start: "2336860", end: "2363100" }
+          - { slice: "07", start: "2363101", end: "2389341" }
+          - { slice: "08", start: "2389342", end: "2415582" }
+          - { slice: "09", start: "2415583", end: "2441823" }
+          - { slice: "10", start: "2441824", end: "2468064" }
+          - { slice: "11", start: "2468065", end: "2494305" }
+          - { slice: "12", start: "2494306", end: "2520546" }
+          - { slice: "13", start: "2520547", end: "2546787" }
+          - { slice: "14", start: "2546788", end: "2573028" }
+          - { slice: "15", start: "2573029", end: "2599269" }
+          - { slice: "16", start: "2599270", end: "2625510" }
+          - { slice: "17", start: "2625511", end: "2651751" }
+          - { slice: "18", start: "2651752", end: "2677992" }
+          - { slice: "19", start: "2677993", end: "2704233" }
+          - { slice: "20", start: "2704234", end: "2730264" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install requests boto3 botocore
-      - name: Download DS11 slice ${{ matrix.slice }}
+      - name: DS11 slice ${{ matrix.slice }}
         env:
           DATASET_NUMBER: "11"
           SLICE_START:    ${{ matrix.start }}
