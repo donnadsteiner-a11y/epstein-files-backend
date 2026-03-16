@@ -1,0 +1,51 @@
+name: Dataset 12 — PDF Downloader
+
+on:
+  # Run every 4 hours automatically until all files are downloaded
+  schedule:
+    - cron: "0 */4 * * *"
+
+  # Also allow a manual trigger from the GitHub Actions tab
+  workflow_dispatch:
+
+jobs:
+  download:
+    name: Download & Upload DS12 PDFs
+    runs-on: ubuntu-latest
+
+    # GitHub Actions free tier caps jobs at 6 hours.
+    # The script is fully resumable — each run picks up where the last left off.
+    timeout-minutes: 340
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests boto3 beautifulsoup4 botocore
+
+      - name: Run DS12 downloader
+        env:
+          DOJ_COOKIES:    ${{ secrets.DOJ_COOKIES }}
+          DO_ENDPOINT:    ${{ secrets.DO_ENDPOINT }}
+          DO_ACCESS_KEY:  ${{ secrets.DO_ACCESS_KEY }}
+          DO_SECRET_KEY:  ${{ secrets.DO_SECRET_KEY }}
+          DO_BUCKET:      ${{ secrets.DO_BUCKET }}
+        run: |
+          python ds12_downloader.py
+
+      # Upload any failed-URL list as an artifact so you can inspect it
+      - name: Upload failed URLs artifact (if any)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-urls
+          path: failed_urls.txt
+          if-no-files-found: ignore
