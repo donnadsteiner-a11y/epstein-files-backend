@@ -211,7 +211,10 @@ def main():
     print(f"  Failed      : {_failed_count:,}")
     print("=" * 60)
 
-    if _failed_count > 0:
+    # Exit 1 only if zero files were uploaded AND there were S3 failures —
+    # "not found" files are expected gaps (DOJ deletions Kino doesn't have).
+    # Partial success with some S3 failures is still a successful run.
+    if _failed_count > 0 and _uploaded_count == 0:
         sys.exit(1)
 
 
