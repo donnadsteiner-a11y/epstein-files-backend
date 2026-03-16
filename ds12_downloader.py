@@ -129,7 +129,9 @@ def fetch_corpus_eftas() -> set:
                 continue
 
             try:
-                efta_int = int(efta)
+                # Strip EFTA prefix if present (e.g. "EFTA02730265" → "02730265")
+                efta_clean = efta.upper().replace("EFTA", "").strip()
+                efta_int = int(efta_clean)
                 if EFTA_RANGE_START <= efta_int <= EFTA_RANGE_END:
                     eftas.add(f"{efta_int:08d}")
             except ValueError:
