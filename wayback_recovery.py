@@ -4,9 +4,9 @@ wayback_recovery.py
 ===================
 Recovers missing Epstein Files PDFs from the Wayback Machine CDX API.
 
-For each dataset, queries the CDX API to find every EFTA PDF that was
-captured on or around January 31, 2026 — including files the DOJ has
-since removed. Downloads each missing PDF and uploads to DreamObjects.
+Queries Wayback for every EFTA PDF captured from the DOJ between
+January 30 and March 31, 2026 — including files the DOJ has since
+removed (~64,259 confirmed deleted per rhowardstone audit).
 
 Uploads to: docketzero-files/Data Set {N}/EFTA########.pdf
 
@@ -31,20 +31,21 @@ import requests
 from botocore.config import Config
 
 # ── Dataset registry ───────────────────────────────────────────────────────────
+# DOJ folder names have SPACES — this is how Wayback captured the URLs
 
 DATASETS = {
-    1:  {"folder": "DataSet%201",   "prefix": "Data Set 1"},
-    2:  {"folder": "DataSet%202",   "prefix": "Data Set 2"},
-    3:  {"folder": "DataSet%203",   "prefix": "Data Set 3"},
-    4:  {"folder": "DataSet%204",   "prefix": "Data Set 4"},
-    5:  {"folder": "DataSet%205",   "prefix": "Data Set 5"},
-    6:  {"folder": "DataSet%206",   "prefix": "Data Set 6"},
-    7:  {"folder": "DataSet%207",   "prefix": "Data Set 7"},
-    8:  {"folder": "DataSet%208",   "prefix": "Data Set 8"},
-    9:  {"folder": "DataSet%209",   "prefix": "Data Set 9"},
-    10: {"folder": "DataSet%2010",  "prefix": "Data Set 10"},
-    11: {"folder": "DataSet%2011",  "prefix": "Data Set 11"},
-    12: {"folder": "DataSet%2012",  "prefix": "Data Set 12"},
+    1:  {"folder": "DataSet 1",   "prefix": "Data Set 1"},
+    2:  {"folder": "DataSet 2",   "prefix": "Data Set 2"},
+    3:  {"folder": "DataSet 3",   "prefix": "Data Set 3"},
+    4:  {"folder": "DataSet 4",   "prefix": "Data Set 4"},
+    5:  {"folder": "DataSet 5",   "prefix": "Data Set 5"},
+    6:  {"folder": "DataSet 6",   "prefix": "Data Set 6"},
+    7:  {"folder": "DataSet 7",   "prefix": "Data Set 7"},
+    8:  {"folder": "DataSet 8",   "prefix": "Data Set 8"},
+    9:  {"folder": "DataSet 9",   "prefix": "Data Set 9"},
+    10: {"folder": "DataSet 10",  "prefix": "Data Set 10"},
+    11: {"folder": "DataSet 11",  "prefix": "Data Set 11"},
+    12: {"folder": "DataSet 12",  "prefix": "Data Set 12"},
 }
 
 # ── Environment ────────────────────────────────────────────────────────────────
@@ -59,32 +60,23 @@ if DATASET_NUMBER not in DATASETS:
     print(f"ERROR: DATASET_NUMBER {DATASET_NUMBER} not in registry (1-12)")
     sys.exit(1)
 
-DS        = DATASETS[DATASET_NUMBER]
-S3_PREFIX = DS["prefix"]
+DS         = DATASETS[DATASET_NUMBER]
+S3_PREFIX  = DS["prefix"]
 DOJ_FOLDER = DS["folder"]
-
-# The DOJ URL pattern Wayback captured
-DOJ_URL_PATTERN = (
-    f"https://www.justice.gov/epstein/files/"
-    f"{urllib.parse.unquote(DOJ_FOLDER)}/EFTA*.pdf"
-)
-DOJ_URL_ENCODED = (
-    f"https://www.justice.gov/epstein/files/{DOJ_FOLDER}/EFTA"
-)
 
 # CDX API endpoint
 CDX_API = "http://web.archive.org/cdx/search/cdx"
 
-# Wayback raw file endpoint (if_ returns raw file, not toolbar)
+# Wayback raw file endpoint — if_ returns the raw file not the toolbar wrapper
 WAYBACK_RAW = "https://web.archive.org/web/{timestamp}if_/{url}"
 
-DELAY_BETWEEN  = 1.5   # be polite to Wayback
+DELAY_BETWEEN  = 1.5
 DELAY_ON_ERROR = 15.0
 
 HEADERS = {
     "User-Agent": (
         "DocketZero/1.0 Research Archive "
-        "(contact: docketzero.com; recovering public DOJ records)"
+        "(public DOJ records preservation; contact docketzero.com)"
     ),
 }
 
@@ -130,63 +122,75 @@ def upload(s3, key: str, data: bytes) -> bool:
         return False
 
 
-# ── CDX API: get all captured EFTA URLs ───────────────────────────────────────
+# ── CDX API query ─────────────────────────────────────────────────────────────
 
 def query_cdx(session: requests.Session) -> list:
     """
-    Query the Wayback CDX API for all captured PDFs from this dataset.
-    Returns a list of (efta_str, timestamp, original_url) tuples.
-    Picks the earliest capture (closest to Jan 31, 2026) for each EFTA.
+    Query Wayback CDX API for all captured PDFs from this dataset.
+    
+    The DOJ URLs contain literal spaces in folder names (e.g. "DataSet 12")
+    which is how Wayback indexed them. We query using the exact URL pattern.
+    
+    Returns list of (efta_str, timestamp, original_url) tuples.
     """
     print(f"  Querying Wayback CDX API for DS{DATASET_NUMBER} PDFs ...")
 
-    # CDX API parameters
-    # matchType=prefix matches all URLs starting with the DOJ dataset folder
-    # filter=statuscode:200 only gets successful captures
-    # fl=original,timestamp gets just the URL and timestamp
-    # output=text for simple parsing
-    # from/to narrows to Jan 30 - Mar 31, 2026 window
-    params = {
-        "url":       f"www.justice.gov/epstein/files/{urllib.parse.unquote(DOJ_FOLDER)}/EFTA*.pdf",
-        "matchType": "prefix",
-        "filter":    "statuscode:200",
-        "fl":        "original,timestamp",
-        "output":    "text",
-        "from":      "20260130",
-        "to":        "20260331",
-        "collapse":  "original",   # one entry per unique URL (earliest capture)
-    }
+    # The URL pattern as captured by Wayback — with literal space
+    url_pattern = f"www.justice.gov/epstein/files/{DOJ_FOLDER}/EFTA*.pdf"
 
-    try:
-        resp = session.get(CDX_API, params=params, timeout=120)
-        if resp.status_code != 200:
-            print(f"  CDX API returned HTTP {resp.status_code}")
-            return []
-    except requests.RequestException as exc:
-        print(f"  CDX API error: {exc}")
-        return []
+    # Try multiple query variations since Wayback may have indexed with
+    # either spaces or %20 encoding
+    all_results = {}
 
-    lines = resp.text.strip().split("\n")
-    results = []
+    for url_pat in [
+        url_pattern,
+        url_pattern.replace(" ", "%20"),
+        url_pattern.replace(" ", "%2520"),  # double-encoded
+    ]:
+        params = {
+            "url":       url_pat,
+            "matchType": "prefix",
+            "filter":    "statuscode:200",
+            "fl":        "original,timestamp",
+            "output":    "text",
+            "from":      "20260130",
+            "to":        "20260401",
+            "collapse":  "original",
+        }
 
-    for line in lines:
-        if not line.strip():
-            continue
-        parts = line.strip().split(" ")
-        if len(parts) < 2:
-            continue
-        original_url = parts[0]
-        timestamp    = parts[1]
+        print(f"    Trying URL pattern: {url_pat[:60]}...")
 
-        # Extract EFTA number from URL
-        match = re.search(r"EFTA(\d+)\.pdf", original_url, re.IGNORECASE)
-        if not match:
+        try:
+            resp = session.get(CDX_API, params=params, timeout=120)
+            if resp.status_code != 200:
+                print(f"    CDX HTTP {resp.status_code} — trying next pattern")
+                continue
+        except requests.RequestException as exc:
+            print(f"    CDX error: {exc} — trying next pattern")
             continue
 
-        efta_str = f"{int(match.group(1)):08d}"
-        results.append((efta_str, timestamp, original_url))
+        lines = [l for l in resp.text.strip().split("\n") if l.strip()]
+        print(f"    Got {len(lines)} results")
 
-    print(f"  CDX API returned {len(results)} captured URLs")
+        for line in lines:
+            parts = line.strip().split(" ")
+            if len(parts) < 2:
+                continue
+            original_url = parts[0]
+            timestamp    = parts[1]
+            match = re.search(r"EFTA(\d+)\.pdf", original_url, re.IGNORECASE)
+            if not match:
+                continue
+            efta_str = f"{int(match.group(1)):08d}"
+            # Keep earliest capture for each EFTA
+            if efta_str not in all_results:
+                all_results[efta_str] = (efta_str, timestamp, original_url)
+
+        if all_results:
+            break  # found results — no need to try other patterns
+
+    results = list(all_results.values())
+    print(f"  CDX API returned {len(results):,} unique captured URLs")
     return results
 
 
@@ -198,6 +202,7 @@ def main():
     print("=" * 60)
     print(f"  Bucket    : {DO_BUCKET}")
     print(f"  Prefix    : {S3_PREFIX}/")
+    print(f"  DOJ folder: {DOJ_FOLDER}")
     print(f"  Source    : Wayback Machine CDX API")
     print("=" * 60)
 
@@ -208,29 +213,31 @@ def main():
     s3       = build_s3()
     uploaded = fetch_uploaded_keys(s3)
 
-    # Query CDX for all captured PDFs
+    # Query CDX
     print()
     captures = query_cdx(session)
 
     if not captures:
         print("\nNo captures found in Wayback for this dataset.")
-        print("This dataset may not have been archived, or the CDX query needs adjustment.")
+        print("Wayback may not have archived these files, or they need")
+        print("a different URL pattern. Try checking manually:")
+        print(f"  https://web.archive.org/web/*/https://www.justice.gov/epstein/files/{DOJ_FOLDER}/EFTA*.pdf")
         sys.exit(0)
 
-    # Filter to only files not already in DreamObjects
+    # Filter to missing files only
     missing = [
         (efta, ts, url)
         for efta, ts, url in captures
         if f"{S3_PREFIX}/EFTA{efta}.pdf" not in uploaded
     ]
 
-    total_captured  = len(captures)
-    total_missing   = len(missing)
-    total_already   = total_captured - total_missing
+    total_captured = len(captures)
+    total_missing  = len(missing)
+    total_already  = total_captured - total_missing
 
-    print(f"\n  Captured in Wayback   : {total_captured:,}")
+    print(f"\n  Captured in Wayback    : {total_captured:,}")
     print(f"  Already in DreamObjects: {total_already:,}")
-    print(f"  To recover            : {total_missing:,}")
+    print(f"  To recover             : {total_missing:,}")
 
     if total_missing == 0:
         print("\n  ✓ Nothing to recover — all Wayback captures already in DreamObjects!")
@@ -245,13 +252,13 @@ def main():
         filename = f"EFTA{efta}.pdf"
         s3_key   = f"{S3_PREFIX}/{filename}"
 
-        # Build the Wayback raw URL
+        # Build Wayback raw URL
         wayback_url = WAYBACK_RAW.format(
             timestamp=timestamp,
             url=original_url
         )
 
-        print(f"  [{idx}/{total_missing}]  {filename}  (captured {timestamp[:8]})", end="  ", flush=True)
+        print(f"  [{idx}/{total_missing}]  {filename}  ({timestamp[:8]})", end="  ", flush=True)
 
         try:
             resp = session.get(wayback_url, timeout=90)
@@ -268,15 +275,14 @@ def main():
             continue
 
         if resp.status_code != 200:
-            print(f"✗  HTTP {resp.status_code} from Wayback")
+            print(f"✗  HTTP {resp.status_code}")
             failed.append(efta)
             time.sleep(DELAY_ON_ERROR)
             continue
 
-        # Check we got a PDF not a Wayback error page
         ctype = resp.headers.get("Content-Type", "")
         if "html" in ctype.lower():
-            print(f"✗  Got HTML (Wayback may have returned error page)")
+            print(f"✗  Got HTML (Wayback error page)")
             failed.append(efta)
             time.sleep(DELAY_BETWEEN)
             continue
@@ -297,7 +303,6 @@ def main():
 
         time.sleep(DELAY_BETWEEN)
 
-    # Summary
     print("\n" + "=" * 60)
     print(f"  Recovery complete — DS{DATASET_NUMBER}")
     print(f"  Recovered this run : {recovered:,}")
