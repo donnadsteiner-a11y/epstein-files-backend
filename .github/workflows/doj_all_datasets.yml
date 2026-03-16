@@ -1,0 +1,50 @@
+name: DOJ — Download All Datasets
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+jobs:
+  download:
+    name: "DS${{ matrix.dataset }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    strategy:
+      fail-fast: false        # if one dataset fails, others keep running
+      matrix:
+        dataset: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests boto3 beautifulsoup4 botocore
+
+      - name: Download Dataset ${{ matrix.dataset }}
+        env:
+          DATASET_NUMBER: ${{ matrix.dataset }}
+          DOJ_COOKIES:    ${{ secrets.DOJ_COOKIES }}
+          DO_ENDPOINT:    ${{ secrets.DO_ENDPOINT }}
+          DO_ACCESS_KEY:  ${{ secrets.DO_ACCESS_KEY }}
+          DO_SECRET_KEY:  ${{ secrets.DO_SECRET_KEY }}
+          DO_BUCKET:      ${{ secrets.DO_BUCKET }}
+        run: |
+          python doj_downloader.py
+
+      - name: Upload failed URLs artifact (if any)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-ds${{ matrix.dataset }}
+          path: failed_urls.txt
+          if-no-files-found: ignore
