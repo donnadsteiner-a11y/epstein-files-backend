@@ -19,7 +19,6 @@ Required environment variables (GitHub Secrets):
 
 import json
 import os
-import re
 import sys
 import time
 import urllib.parse
@@ -118,20 +117,20 @@ def upload_to_s3(s3, key: str, data: bytes) -> bool:
 
 # ── DOJ scraping ───────────────────────────────────────────────────────────────
 
-def scrape_pdf_links_from_page(session: requests.Session, url: str) -> tuple[list[str], bool]:
+def scrape_pdf_links_from_page(session: requests.Session, url: str) -> list[str]:
     try:
         resp = session.get(url, timeout=30)
     except requests.RequestException as exc:
         print(f"    Request error fetching {url}: {exc}")
-        return [], False
+        return []
 
     if resp.status_code != 200:
         print(f"    HTTP {resp.status_code} on {url}")
-        return [], False
+        return []
 
     if "Access Denied" in resp.text and len(resp.text) < 3000:
         print(f"    Access Denied response on {url} — stopping pagination.")
-        return [], False
+        return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -148,19 +147,14 @@ def scrape_pdf_links_from_page(session: requests.Session, url: str) -> tuple[lis
             abs_url = DOJ_BASE + "/" + href
         pdf_urls.append(abs_url)
 
-    has_next = bool(
-        soup.find("a", rel="next")
-        or soup.find("li", class_=re.compile(r"next"))
-        or soup.find("a", string=re.compile(r"next", re.IGNORECASE))
-    )
-
-    return pdf_urls, has_next
+    return pdf_urls
 
 
 def scrape_all_pdf_links(session: requests.Session) -> list[str]:
     all_urls = []
     seen     = set()
     page_num = 0
+    empty_pages = 0  # stop after 2 consecutive empty pages
 
     print(f"\n── Scraping DS1 listing pages ───────────────────────────")
 
@@ -168,7 +162,7 @@ def scrape_all_pdf_links(session: requests.Session) -> list[str]:
         url = DOJ_LISTING if page_num == 0 else f"{DOJ_LISTING}?page={page_num}"
         print(f"  Page {page_num}: {url}")
 
-        links, has_next = scrape_pdf_links_from_page(session, url)
+        links = scrape_pdf_links_from_page(session, url)
 
         new_links = [u for u in links if u not in seen]
         seen.update(new_links)
@@ -176,13 +170,13 @@ def scrape_all_pdf_links(session: requests.Session) -> list[str]:
 
         print(f"    Found {len(links)} PDF links ({len(new_links)} new) — total so far: {len(all_urls)}")
 
-        if not links:
-            print("    No PDFs found on this page — done.")
-            break
-
-        if not has_next:
-            print("    No next-page link — done.")
-            break
+        if len(new_links) == 0:
+            empty_pages += 1
+            if empty_pages >= 2:
+                print("    Two consecutive empty pages — pagination complete.")
+                break
+        else:
+            empty_pages = 0
 
         page_num += 1
         time.sleep(DELAY_BETWEEN_REQUESTS)
