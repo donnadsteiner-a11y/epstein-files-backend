@@ -1,0 +1,77 @@
+name: Wayback — Recover Missing PDFs
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: "Dataset number to recover (1-12, or 'all')"
+        required: true
+        default: "12"
+
+jobs:
+  # Single dataset recovery
+  recover-single:
+    name: "Recover DS${{ github.event.inputs.dataset }}"
+    if: github.event.inputs.dataset != 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests boto3 botocore
+
+      - name: Recover Dataset ${{ github.event.inputs.dataset }}
+        env:
+          DATASET_NUMBER: ${{ github.event.inputs.dataset }}
+          DO_ENDPOINT:    ${{ secrets.DO_ENDPOINT }}
+          DO_ACCESS_KEY:  ${{ secrets.DO_ACCESS_KEY }}
+          DO_SECRET_KEY:  ${{ secrets.DO_SECRET_KEY }}
+          DO_BUCKET:      ${{ secrets.DO_BUCKET }}
+        run: |
+          python wayback_recovery.py
+
+  # All datasets recovery (matrix)
+  recover-all:
+    name: "Recover DS${{ matrix.dataset }}"
+    if: github.event.inputs.dataset == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    strategy:
+      fail-fast: false
+      matrix:
+        dataset: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests boto3 botocore
+
+      - name: Recover Dataset ${{ matrix.dataset }}
+        env:
+          DATASET_NUMBER: ${{ matrix.dataset }}
+          DO_ENDPOINT:    ${{ secrets.DO_ENDPOINT }}
+          DO_ACCESS_KEY:  ${{ secrets.DO_ACCESS_KEY }}
+          DO_SECRET_KEY:  ${{ secrets.DO_SECRET_KEY }}
+          DO_BUCKET:      ${{ secrets.DO_BUCKET }}
+        run: |
+          python wayback_recovery.py
