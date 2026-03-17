@@ -1,12 +1,12 @@
 /**
  * DocketZero API Server
- * Handles: auth (register/login/me), contact form, archive stats
  */
 
 const express    = require('express');
 const cors       = require('cors');
 const helmet     = require('helmet');
 const rateLimit  = require('express-rate-limit');
+const pool       = require('./db/pool');
 
 const authRouter    = require('./routes/auth');
 const contactRouter = require('./routes/contact');
@@ -15,28 +15,70 @@ const statsRouter   = require('./routes/stats');
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
+// ── Auto-migrate on startup ───────────────────────────────────────────────────
+async function runMigrations() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id                   SERIAL PRIMARY KEY,
+        email                VARCHAR(255) NOT NULL UNIQUE,
+        password_hash        VARCHAR(255) NOT NULL,
+        first_name           VARCHAR(100) NOT NULL,
+        last_name            VARCHAR(100) NOT NULL,
+        role                 VARCHAR(100),
+        interest             VARCHAR(200),
+        referral_source      VARCHAR(200),
+        age_verified         BOOLEAN NOT NULL DEFAULT FALSE,
+        disclaimer_accepted  BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_login           TIMESTAMPTZ,
+        is_active            BOOLEAN NOT NULL DEFAULT TRUE
+      );
+      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+      CREATE TABLE IF NOT EXISTS contact_submissions (
+        id           SERIAL PRIMARY KEY,
+        first_name   VARCHAR(100) NOT NULL,
+        last_name    VARCHAR(100) NOT NULL,
+        email        VARCHAR(255) NOT NULL,
+        role         VARCHAR(100),
+        subject      VARCHAR(100) NOT NULL,
+        message      TEXT NOT NULL,
+        file_count   INTEGER DEFAULT 0,
+        ip_address   VARCHAR(45),
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS refresh_tokens (
+        id          SERIAL PRIMARY KEY,
+        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_hash  VARCHAR(255) NOT NULL UNIQUE,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at  TIMESTAMPTZ NOT NULL,
+        revoked     BOOLEAN NOT NULL DEFAULT FALSE
+      );
+      CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
+    `);
+    console.log('[DB] Tables ready');
+  } catch (err) {
+    console.error('[DB] Migration error:', err.message);
+  }
+}
+
 // ── Security headers ──────────────────────────────────────────────────────────
 app.use(helmet());
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
-// Allow requests from your DreamHost site and localhost for dev
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(o => o.trim())
-  .filter(Boolean);
-
-// Always allow these
-ALLOWED_ORIGINS.push(
+const ALLOWED_ORIGINS = [
   'https://docketzero.com',
   'https://www.docketzero.com',
   'http://localhost:3000',
   'http://localhost:5000',
-  'http://127.0.0.1:5500'   // VS Code Live Server
-);
+  'http://127.0.0.1:5500',
+];
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, curl, Postman)
     if (!origin) return callback(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
     callback(new Error(`CORS blocked: ${origin}`));
@@ -50,7 +92,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ── Global rate limiting ──────────────────────────────────────────────────────
 app.use(rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   max: 100,
   standardHeaders: true,
   legacyHeaders: false,
@@ -75,7 +117,6 @@ app.use((req, res) => {
 // ── Error handler ─────────────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
   console.error('[ERROR]', err.message);
-  // Never expose stack traces in production
   res.status(err.status || 500).json({
     error: process.env.NODE_ENV === 'production'
       ? 'An unexpected error occurred.'
@@ -84,7 +125,8 @@ app.use((err, req, res, next) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`DocketZero API running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  await runMigrations();
 });
