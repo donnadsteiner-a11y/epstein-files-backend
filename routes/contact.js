@@ -48,7 +48,7 @@ const contactLimit = rateLimit({
 
 // ── Email transporter ─────────────────────────────────────────────────────────
 function createTransporter() {
-  return nodemailer.createTransporter({
+  return nodemailer.createTransport({
     host:   process.env.SMTP_HOST,
     port:   parseInt(process.env.SMTP_PORT || '587'),
     secure: process.env.SMTP_PORT === '465',  // true for 465, false for 587
