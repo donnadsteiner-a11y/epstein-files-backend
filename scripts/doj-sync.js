@@ -98,6 +98,16 @@ function extractEFTAs(html) {
 // ---------------------------------------------------------------------------
 async function crawlDOJ() {
   console.log(`\n=== Crawling DOJ DataSet ${DATASET} ===`);
+
+  // Warmup — hit the main disclosures page first to establish session
+  console.log('  Warming up session...');
+  try {
+    await fetchWithRetry(`${DOJ_BASE}/epstein/doj-disclosures`);
+    await sleep(3000 + Math.floor(Math.random() * 3000));
+  } catch (err) {
+    console.log(`  Warmup failed (continuing anyway): ${err.message}`);
+  }
+
   const allEFTAs = new Set();
   let page = 0;
   let emptyPages = 0;
@@ -131,7 +141,10 @@ async function crawlDOJ() {
     }
 
     page++;
-    await sleep(1500);
+    // Random delay 8-20 seconds between pages to avoid Akamai rate limiting
+    const delay = 8000 + Math.floor(Math.random() * 12000);
+    console.log(`  Waiting ${(delay/1000).toFixed(1)}s before next page...`);
+    await sleep(delay);
   }
 
   console.log(`\nDOJ total for DataSet ${DATASET}: ${allEFTAs.size} files`);
