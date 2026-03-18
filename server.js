@@ -111,6 +111,38 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// ── DOJ IP test — checks if Railway's IP can reach DOJ listing pages ─────────
+// TEMPORARY — remove once IP test is confirmed
+app.get('/api/test-doj', async (req, res) => {
+  try {
+    const fetch = (await import('node-fetch')).default;
+    const response = await fetch(
+      'https://www.justice.gov/epstein/doj-disclosures/data-set-12-files?page=1',
+      {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'Cookie': 'age_verified=1; EFTA_age_gate=1; Drupal.visitor.doj_age_gate=1',
+          'Accept': 'text/html,application/xhtml+xml',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Referer': 'https://www.justice.gov/epstein/doj-disclosures',
+        },
+        timeout: 15000,
+      }
+    );
+    const text = await response.text();
+    const hasFiles = text.includes('EFTA');
+    const fileCount = (text.match(/EFTA\d{8}/g) || []).length;
+    res.json({
+      status: response.status,
+      has_efta_files: hasFiles,
+      file_count_on_page: fileCount,
+      blocked: response.status === 403,
+    });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use('/api/auth',    authRouter);
 app.use('/api/contact', contactRouter);
