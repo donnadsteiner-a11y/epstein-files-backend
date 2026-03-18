@@ -1,0 +1,68 @@
+name: DOJ Dataset Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: 'Dataset to sync (1-12, or "all")'
+        required: false
+        default: 'all'
+      dry_run:
+        description: 'Dry run - report missing files without downloading'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+  schedule:
+    - cron: '0 6 * * *'   # Every day at 6am UTC
+
+jobs:
+  sync:
+    name: Sync Dataset ${{ matrix.dataset }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false   # Keep running other datasets if one fails
+      matrix:
+        dataset: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+    steps:
+      - name: Check if this dataset should run
+        id: check
+        run: |
+          INPUT="${{ github.event.inputs.dataset }}"
+          DS="${{ matrix.dataset }}"
+          if [ -z "$INPUT" ] || [ "$INPUT" = "all" ] || [ "$INPUT" = "$DS" ]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout repo
+        if: steps.check.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: steps.check.outputs.run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        if: steps.check.outputs.run == 'true'
+        run: npm install node-fetch@2 @aws-sdk/client-s3
+
+      - name: Crawl DOJ + Sync to DreamObjects
+        if: steps.check.outputs.run == 'true'
+        env:
+          DO_ACCESS_KEY: ${{ secrets.DO_ACCESS_KEY }}
+          DO_SECRET_KEY: ${{ secrets.DO_SECRET_KEY }}
+          DO_BUCKET:     ${{ secrets.DO_BUCKET }}
+          DO_ENDPOINT:   ${{ secrets.DO_ENDPOINT }}
+          DATASET:       ${{ matrix.dataset }}
+          DRY_RUN:       ${{ github.event.inputs.dry_run || 'false' }}
+        run: node scripts/doj-sync.js
