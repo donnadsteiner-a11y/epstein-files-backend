@@ -131,15 +131,18 @@ async function isOnDOJ(ds, eftaPadded) {
       signal:   controller.signal,
     });
     clearTimeout(timer);
-    // DOJ returns 200 for live files, 404 for removed ones
-    // 403 sometimes appears for rate-limiting — treat as unknown, don't cache
-    if (res.status === 403) return null;
-    const live = res.status === 200;
+
+    if (res.status === 403) return null;  // rate limited — don't cache
+
+    // DOJ returns 200 + text/html for the age gate even when the PDF is gone.
+    // Only treat as live if Content-Type is actually a PDF.
+    const contentType = res.headers.get('content-type') || '';
+    const live = res.status === 200 && contentType.includes('pdf');
+
     setCache(cacheKey, live, DOJ_CACHE_TTL);
     return live;
   } catch {
-    // Network error — assume DOJ unreachable, fall back to archive
-    return null;
+    return null;  // network error — fall back to archive
   }
 }
 
