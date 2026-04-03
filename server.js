@@ -12,6 +12,7 @@ const authRouter    = require('./routes/auth');
 const contactRouter = require('./routes/contact');
 const statsRouter   = require('./routes/stats');
 const resolveRoute = require('./resolve-route');
+const searchesRouter = require('./routes/searches');
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -58,6 +59,19 @@ async function runMigrations() {
         expires_at  TIMESTAMPTZ NOT NULL,
         revoked     BOOLEAN NOT NULL DEFAULT FALSE
       );
+	CREATE TABLE IF NOT EXISTS saved_searches (
+      id           SERIAL PRIMARY KEY,
+      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name         VARCHAR(200) NOT NULL,
+      query        TEXT,
+      dataset      VARCHAR(50),
+      filters      JSONB DEFAULT '{}',
+      result_count INTEGER DEFAULT 0,
+      pinned       BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_saved_searches_user_id ON saved_searches(user_id);
       CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
     `);
     console.log('[DB] Tables ready');
@@ -149,6 +163,7 @@ app.use('/api', resolveRoute);
 app.use('/api/auth',    authRouter);
 app.use('/api/contact', contactRouter);
 app.use('/api/stats',   statsRouter);
+app.use('/api/users', searchesRouter);
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((req, res) => {
