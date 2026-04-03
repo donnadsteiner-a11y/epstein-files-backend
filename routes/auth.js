@@ -1,21 +1,22 @@
-/**
+﻿/**
  * Auth routes
- *   POST /api/auth/register   — create account
- *   POST /api/auth/login      — sign in
- *   PATCH /api/auth/me        — update age_verified, disclaimer_accepted, role etc.
- *   GET  /api/auth/me         — get current user profile
+ *   POST /api/auth/register   â€” create account
+ *   POST /api/auth/login      â€” sign in
+ *   PATCH /api/auth/me        â€” update age_verified, disclaimer_accepted, role etc.
+ *   GET  /api/auth/me         â€” get current user profile
  */
 
 const express    = require('express');
 const bcrypt     = require('bcrypt');
 const jwt        = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
 const rateLimit  = require('express-rate-limit');
 const pool       = require('../db/pool');
 const { requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Tighter rate limit on auth endpoints — 10 attempts per 15 min
+// Tighter rate limit on auth endpoints â€” 10 attempts per 15 min
 const authLimit = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -23,7 +24,7 @@ const authLimit = rateLimit({
   skipSuccessfulRequests: true,
 });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((email || '').trim());
@@ -57,7 +58,83 @@ function safeUser(row) {
   };
 }
 
-// ── POST /api/auth/register ───────────────────────────────────────────────────
+// ── Welcome email ────────────────────────────────────────────────────────────
+async function sendWelcomeEmail(user) {
+  const transporter = nodemailer.createTransport({
+    host:   process.env.SMTP_HOST,
+    port:   parseInt(process.env.SMTP_PORT || '587'),
+    secure: process.env.SMTP_PORT === '465',
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+    tls: { rejectUnauthorized: process.env.NODE_ENV === 'production' },
+  });
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:600px;color:#0f1720">
+      <div style="background:#102131;padding:20px 28px;border-radius:8px 8px 0 0">
+        <img src="https://docketzero.com/assets/docketzero_logo_horizontal.png"
+             alt="DocketZero" style="height:36px;margin-bottom:4px" />
+      </div>
+      <div style="background:#f9fbfd;padding:28px;border:1px solid #dbe4ec;border-top:none">
+        <h2 style="margin:0 0 12px;font-size:20px;color:#0f1720">
+          Welcome to DocketZero, ${user.first_name}.
+        </h2>
+        <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#304355">
+          Your account has been created. You now have access to the full DocketZero
+          research archive — including documents the DOJ has quietly removed from
+          their servers.
+        </p>
+        <div style="margin-bottom:20px">
+          <a href="https://docketzero.com/dashboard.html"
+             style="display:inline-block;background:#102131;color:#fff;
+                    padding:12px 24px;border-radius:10px;font-weight:700;
+                    font-size:14px;text-decoration:none">
+            Go to your dashboard →
+          </a>
+        </div>
+        <p style="margin:0 0 10px;font-size:14px;font-weight:700;color:#0f1720">
+          What you can do:
+        </p>
+        <ul style="margin:0 0 20px;padding-left:20px;font-size:14px;
+                   line-height:1.9;color:#304355">
+          <li>Search 1.4 million preserved documents by name, EFTA number, or dataset</li>
+          <li>Browse 1,614 named individuals identified across the archive</li>
+          <li>Save searches to your dashboard for quick access</li>
+          <li>Track files the DOJ has removed — DocketZero serves preserved copies</li>
+        </ul>
+        <p style="margin:0;font-size:14px;color:#304355;line-height:1.7">
+          Questions? Reach us at
+          <a href="mailto:support@docketzero.com"
+             style="color:#193146;font-weight:700">support@docketzero.com</a>.
+        </p>
+      </div>
+      <div style="background:#eef3f8;padding:14px 28px;border-radius:0 0 8px 8px;
+                  border:1px solid #dbe4ec;border-top:none">
+        <p style="margin:0;font-size:12px;color:#7a96ae">
+          DocketZero · Preserving the public record ·
+          <a href="https://docketzero.com" style="color:#7a96ae">docketzero.com</a>
+        </p>
+        <p style="margin:6px 0 0;font-size:11px;color:#9ab0c4">
+          Inclusion in these records does not imply criminal conduct or legal liability.
+          All individuals are presumed innocent unless proven guilty in a court of law.
+        </p>
+      </div>
+    </div>
+  `;
+
+  await transporter.sendMail({
+    from:    `"DocketZero" <${process.env.SMTP_USER}>`,
+    to:      user.email,
+    subject: `Welcome to DocketZero — your account is ready`,
+    html,
+  });
+
+  console.log(`[AUTH] Welcome email sent to ${user.email}`);
+}
+
+// â”€â”€ POST /api/auth/register â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.post('/register', authLimit, async (req, res) => {
   try {
     const {
@@ -108,6 +185,11 @@ router.post('/register', authLimit, async (req, res) => {
 
     console.log(`[AUTH] New registration: ${emailLower}`);
 
+    // Send welcome email — fire and forget, don't block the response
+    sendWelcomeEmail(user).catch(err =>
+      console.error('[AUTH] Welcome email failed:', err.message)
+    );
+
     res.status(201).json({
       access_token,
       user: safeUser(user),
@@ -119,7 +201,7 @@ router.post('/register', authLimit, async (req, res) => {
   }
 });
 
-// ── POST /api/auth/login ──────────────────────────────────────────────────────
+// â”€â”€ POST /api/auth/login â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.post('/login', authLimit, async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -170,7 +252,7 @@ router.post('/login', authLimit, async (req, res) => {
   }
 });
 
-// ── GET /api/auth/me ──────────────────────────────────────────────────────────
+// â”€â”€ GET /api/auth/me â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.get('/me', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
@@ -190,7 +272,7 @@ router.get('/me', requireAuth, async (req, res) => {
   }
 });
 
-// ── PATCH /api/auth/me ────────────────────────────────────────────────────────
+// â”€â”€ PATCH /api/auth/me â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Updates age_verified, disclaimer_accepted, role, interest, referral_source
 router.patch('/me', requireAuth, async (req, res) => {
   try {
