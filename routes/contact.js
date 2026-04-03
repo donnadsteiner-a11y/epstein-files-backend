@@ -125,12 +125,59 @@ router.post('/', contactLimit, async (req, res) => {
 
     const transporter = createTransporter();
 
+    // Email 1 — notification to DocketZero
     await transporter.sendMail({
       from:    `"DocketZero Contact" <${process.env.SMTP_USER}>`,
       to:      process.env.CONTACT_TO_EMAIL || 'support@docketzero.com',
       replyTo: email.trim(),
       subject: `[DocketZero] ${subjectLabel} — ${first_name.trim()} ${last_name.trim()}`,
       html:    htmlBody,
+    });
+
+    // Email 2 — confirmation to the sender
+    const confirmHtml = `
+      <div style="font-family:Arial,sans-serif;max-width:600px;color:#0f1720">
+        <div style="background:#102131;padding:20px 28px;border-radius:8px 8px 0 0">
+          <img src="https://docketzero.com/assets/docketzero_logo_horizontal.png"
+               alt="DocketZero" style="height:36px;margin-bottom:4px" />
+        </div>
+        <div style="background:#f9fbfd;padding:28px;border:1px solid #dbe4ec;border-top:none">
+          <h2 style="margin:0 0 12px;font-size:20px;color:#0f1720">
+            Thank you for reaching out, ${first_name.trim()}.
+          </h2>
+          <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#304355">
+            We've received your message and will get back to you as soon as possible —
+            typically within 48 hours.
+          </p>
+          <div style="background:#fff;border:1px solid #dbe4ec;border-radius:8px;
+                      padding:16px 20px;margin-bottom:20px">
+            <p style="margin:0 0 6px;font-size:12px;font-weight:700;color:#7a96ae;
+                      text-transform:uppercase;letter-spacing:.05em">Your message</p>
+            <p style="margin:0;font-size:14px;line-height:1.7;color:#304355;
+                      white-space:pre-wrap">${message.trim()}</p>
+          </div>
+          <p style="margin:0;font-size:14px;color:#304355;line-height:1.7">
+            DocketZero is an independent preservation archive of publicly released government
+            records. If you have a time-sensitive matter, you can reach us directly at
+            <a href="mailto:support@docketzero.com" style="color:#193146;font-weight:700">
+              support@docketzero.com</a>.
+          </p>
+        </div>
+        <div style="background:#eef3f8;padding:14px 28px;border-radius:0 0 8px 8px;
+                    border:1px solid #dbe4ec;border-top:none">
+          <p style="margin:0;font-size:12px;color:#7a96ae">
+            DocketZero · Preserving the public record ·
+            <a href="https://docketzero.com" style="color:#7a96ae">docketzero.com</a>
+          </p>
+        </div>
+      </div>
+    `;
+
+    await transporter.sendMail({
+      from:    `"DocketZero" <${process.env.SMTP_USER}>`,
+      to:      email.trim(),
+      subject: `We received your message — DocketZero`,
+      html:    confirmHtml,
     });
 
     console.log(`[CONTACT] Submission from ${email.trim()} — ${subjectLabel}`);
