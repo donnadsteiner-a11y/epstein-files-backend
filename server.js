@@ -8,16 +8,16 @@ const helmet     = require('helmet');
 const rateLimit  = require('express-rate-limit');
 const pool       = require('./db/pool');
 
-const authRouter    = require('./routes/auth');
-const contactRouter = require('./routes/contact');
-const statsRouter   = require('./routes/stats');
-const resolveRoute = require('./resolve-route');
+const authRouter     = require('./routes/auth');
+const contactRouter  = require('./routes/contact');
+const statsRouter    = require('./routes/stats');
 const searchesRouter = require('./routes/searches');
+const resolveRoute   = require('./resolve-route');
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
-// ── Auto-migrate on startup ───────────────────────────────────────────────────
+// ── Auto-migrate on startup ──────────────────────────────────────────────────
 async function runMigrations() {
   try {
     await pool.query(`
@@ -59,20 +59,21 @@ async function runMigrations() {
         expires_at  TIMESTAMPTZ NOT NULL,
         revoked     BOOLEAN NOT NULL DEFAULT FALSE
       );
-	CREATE TABLE IF NOT EXISTS saved_searches (
-      id           SERIAL PRIMARY KEY,
-      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      name         VARCHAR(200) NOT NULL,
-      query        TEXT,
-      dataset      VARCHAR(50),
-      filters      JSONB DEFAULT '{}',
-      result_count INTEGER DEFAULT 0,
-      pinned       BOOLEAN NOT NULL DEFAULT FALSE,
-      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_saved_searches_user_id ON saved_searches(user_id);
       CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
+
+      CREATE TABLE IF NOT EXISTS saved_searches (
+        id           SERIAL PRIMARY KEY,
+        user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name         VARCHAR(200) NOT NULL,
+        query        TEXT,
+        dataset      VARCHAR(50),
+        filters      JSONB DEFAULT '{}',
+        result_count INTEGER DEFAULT 0,
+        pinned       BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_saved_searches_user_id ON saved_searches(user_id);
     `);
     console.log('[DB] Tables ready');
   } catch (err) {
@@ -80,13 +81,13 @@ async function runMigrations() {
   }
 }
 
-// ── Trust proxy (required for Railway/Heroku deployments) ───────────────────
+// ── Trust proxy (required for Railway/Heroku deployments) ────────────────────
 app.set('trust proxy', 1);
 
-// ── Security headers ──────────────────────────────────────────────────────────
+// ── Security headers ─────────────────────────────────────────────────────────
 app.use(helmet());
 
-// ── CORS ──────────────────────────────────────────────────────────────────────
+// ── CORS ─────────────────────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
   'https://docketzero.com',
   'https://www.docketzero.com',
@@ -108,7 +109,7 @@ app.use(cors({
   credentials: true,
 }));
 
-// ── Body parsing ──────────────────────────────────────────────────────────────
+// ── Body parsing ─────────────────────────────────────────────────────────────
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -126,7 +127,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ── DOJ IP test — checks if Railway's IP can reach DOJ listing pages ─────────
+// ── DOJ IP test — checks if Railway's IP can reach DOJ listing pages ──────────
 // TEMPORARY — remove once IP test is confirmed
 app.get('/api/test-doj', async (req, res) => {
   try {
@@ -159,11 +160,12 @@ app.get('/api/test-doj', async (req, res) => {
 });
 
 // ── Routes ────────────────────────────────────────────────────────────────────
-app.use('/api', resolveRoute);
+// IMPORTANT: specific routes must come before the catch-all resolveRoute
 app.use('/api/auth',    authRouter);
 app.use('/api/contact', contactRouter);
 app.use('/api/stats',   statsRouter);
-app.use('/api/users', searchesRouter);
+app.use('/api/users',   searchesRouter);
+app.use('/api',         resolveRoute);   // catch-all — must be last
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((req, res) => {
