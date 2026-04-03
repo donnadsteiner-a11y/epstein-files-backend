@@ -11,6 +11,7 @@ const pool       = require('./db/pool');
 const authRouter    = require('./routes/auth');
 const contactRouter = require('./routes/contact');
 const statsRouter   = require('./routes/stats');
+const resolveRoute = require('./resolve-route');
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -144,6 +145,7 @@ app.get('/api/test-doj', async (req, res) => {
 });
 
 // ── Routes ────────────────────────────────────────────────────────────────────
+app.use('/api', resolveRoute);
 app.use('/api/auth',    authRouter);
 app.use('/api/contact', contactRouter);
 app.use('/api/stats',   statsRouter);
