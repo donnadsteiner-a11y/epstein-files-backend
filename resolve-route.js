@@ -210,17 +210,18 @@ async function isInArchive(ds, eftaPadded) {
 // ── Generate pre-signed URL — DreamObjects v2 signature (HMAC-SHA1) ──────────
 // DreamObjects does not support AWS SDK v4 pre-signed URLs. We use the older
 // v2 query-string signing method (HMAC-SHA1) which DreamObjects fully supports.
+// Note: DreamObjects prohibits response-content-disposition and
+// response-content-type override params on pre-signed requests.
 function getPresignedUrl(ds, eftaPadded) {
-  const s3Key    = `${ds.folder}/EFTA${eftaPadded}.pdf`;
-  const expires  = Math.floor(Date.now() / 1000) + SIGNED_URL_EXPIRY_SECONDS;
-  const bucket   = DO_BUCKET;
-  const host     = DO_ENDPOINT.replace(/^https?:\/\//, '');
+  const s3Key   = `${ds.folder}/EFTA${eftaPadded}.pdf`;
+  const expires = Math.floor(Date.now() / 1000) + SIGNED_URL_EXPIRY_SECONDS;
+  const bucket  = DO_BUCKET;
 
-  // String to sign: METHOD\n\nContent-Type\nExpires\n/bucket/key
+  // String to sign: METHOD\nContent-MD5\nContent-Type\nExpires\n/bucket/key
   const stringToSign = [
     'GET',
-    '',                          // Content-MD5 (empty)
-    '',                          // Content-Type (empty for GET)
+    '',   // Content-MD5 (empty)
+    '',   // Content-Type (empty for GET)
     expires,
     `/${bucket}/${s3Key}`,
   ].join('\n');
@@ -230,15 +231,15 @@ function getPresignedUrl(ds, eftaPadded) {
     .update(stringToSign)
     .digest('base64');
 
+  // Build URL — no response-content-* overrides, DreamObjects prohibits them
+  const encodedKey = s3Key.split('/').map(p => encodeURIComponent(p)).join('/');
   const params = new URLSearchParams({
     AWSAccessKeyId: process.env.DO_ACCESS_KEY,
     Expires:        expires,
     Signature:      signature,
-    'response-content-disposition': `inline; filename="EFTA${eftaPadded}.pdf"`,
-    'response-content-type':        'application/pdf',
   });
 
-  return `${DO_ENDPOINT}/${bucket}/${encodeURIComponent(s3Key)}?${params.toString()}`;
+  return `${DO_ENDPOINT}/${bucket}/${encodedKey}?${params.toString()}`;
 }
 
 // ── Log DOJ removal ───────────────────────────────────────────────────────────
