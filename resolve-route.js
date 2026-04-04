@@ -18,8 +18,8 @@
 const express    = require('express');
 const router     = express.Router();
 const rateLimit  = require('express-rate-limit');
-const { S3Client, HeadObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
-const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { S3Client, HeadObjectCommand } = require('@aws-sdk/client-s3');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -207,16 +207,38 @@ async function isInArchive(ds, eftaPadded) {
   }
 }
 
-// ── Generate pre-signed URL (replaces direct S3 URL) ─────────────────────────
-async function getPresignedUrl(ds, eftaPadded) {
-  const s3Key  = `${ds.folder}/EFTA${eftaPadded}.pdf`;
-  const command = new GetObjectCommand({
-    Bucket:                     DO_BUCKET,
-    Key:                        s3Key,
-    ResponseContentDisposition: `inline; filename="EFTA${eftaPadded}.pdf"`,
-    ResponseContentType:        'application/pdf',
+// ── Generate pre-signed URL — DreamObjects v2 signature (HMAC-SHA1) ──────────
+// DreamObjects does not support AWS SDK v4 pre-signed URLs. We use the older
+// v2 query-string signing method (HMAC-SHA1) which DreamObjects fully supports.
+function getPresignedUrl(ds, eftaPadded) {
+  const s3Key    = `${ds.folder}/EFTA${eftaPadded}.pdf`;
+  const expires  = Math.floor(Date.now() / 1000) + SIGNED_URL_EXPIRY_SECONDS;
+  const bucket   = DO_BUCKET;
+  const host     = DO_ENDPOINT.replace(/^https?:\/\//, '');
+
+  // String to sign: METHOD\n\nContent-Type\nExpires\n/bucket/key
+  const stringToSign = [
+    'GET',
+    '',                          // Content-MD5 (empty)
+    '',                          // Content-Type (empty for GET)
+    expires,
+    `/${bucket}/${s3Key}`,
+  ].join('\n');
+
+  const signature = crypto
+    .createHmac('sha1', process.env.DO_SECRET_KEY)
+    .update(stringToSign)
+    .digest('base64');
+
+  const params = new URLSearchParams({
+    AWSAccessKeyId: process.env.DO_ACCESS_KEY,
+    Expires:        expires,
+    Signature:      signature,
+    'response-content-disposition': `inline; filename="EFTA${eftaPadded}.pdf"`,
+    'response-content-type':        'application/pdf',
   });
-  return getSignedUrl(s3, command, { expiresIn: SIGNED_URL_EXPIRY_SECONDS });
+
+  return `${DO_ENDPOINT}/${bucket}/${encodeURIComponent(s3Key)}?${params.toString()}`;
 }
 
 // ── Log DOJ removal ───────────────────────────────────────────────────────────
@@ -297,7 +319,7 @@ router.get(
       // Generate a pre-signed URL — expires in 1 hour, no direct S3 exposure
       let signedUrl;
       try {
-        signedUrl = await getPresignedUrl(ds, eftaPadded);
+        signedUrl = getPresignedUrl(ds, eftaPadded);
       } catch (err) {
         console.error('[resolve] Pre-sign error:', err.message);
         return res.status(500).json({ error: 'Could not generate archive URL' });
