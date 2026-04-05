@@ -18,7 +18,7 @@
 const express    = require('express');
 const router     = express.Router();
 const rateLimit  = require('express-rate-limit');
-const { S3Client, HeadObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, HeadObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 
@@ -207,39 +207,33 @@ async function isInArchive(ds, eftaPadded) {
   }
 }
 
-// ── Generate pre-signed URL — DreamObjects v2 signature (HMAC-SHA1) ──────────
-// DreamObjects does not support AWS SDK v4 pre-signed URLs. We use the older
-// v2 query-string signing method (HMAC-SHA1) which DreamObjects fully supports.
-// Note: DreamObjects prohibits response-content-disposition and
-// response-content-type override params on pre-signed requests.
-function getPresignedUrl(ds, eftaPadded) {
-  const s3Key   = `${ds.folder}/EFTA${eftaPadded}.pdf`;
-  const expires = Math.floor(Date.now() / 1000) + SIGNED_URL_EXPIRY_SECONDS;
-  const bucket  = DO_BUCKET;
+// ── Stream file from DreamObjects through Railway ────────────────────────────
+// Pre-signed URLs don't work reliably with DreamObjects private buckets.
+// Instead we proxy the file server-side: Railway fetches from S3 using
+// credentials and streams the bytes directly to the browser.
+// The S3 URL is never exposed to the client.
+async function streamFromArchive(ds, eftaPadded, res) {
+  const s3Key = `${ds.folder}/EFTA${eftaPadded}.pdf`;
+  try {
+    const command = new GetObjectCommand({ Bucket: DO_BUCKET, Key: s3Key });
+    const s3Res   = await s3.send(command);
 
-  // String to sign: METHOD\nContent-MD5\nContent-Type\nExpires\n/bucket/key
-  const stringToSign = [
-    'GET',
-    '',   // Content-MD5 (empty)
-    '',   // Content-Type (empty for GET)
-    expires,
-    `/${bucket}/${s3Key}`,
-  ].join('\n');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="EFTA${eftaPadded}.pdf"`);
+    if (s3Res.ContentLength) {
+      res.setHeader('Content-Length', s3Res.ContentLength);
+    }
+    // Cache for 1 hour in browser
+    res.setHeader('Cache-Control', 'private, max-age=3600');
 
-  const signature = crypto
-    .createHmac('sha1', process.env.DO_SECRET_KEY)
-    .update(stringToSign)
-    .digest('base64');
-
-  // Build URL — no response-content-* overrides, DreamObjects prohibits them
-  const encodedKey = s3Key.split('/').map(p => encodeURIComponent(p)).join('/');
-  const params = new URLSearchParams({
-    AWSAccessKeyId: process.env.DO_ACCESS_KEY,
-    Expires:        expires,
-    Signature:      signature,
-  });
-
-  return `${DO_ENDPOINT}/${bucket}/${encodedKey}?${params.toString()}`;
+    // Stream S3 body to response
+    s3Res.Body.pipe(res);
+  } catch (err) {
+    console.error('[resolve] Stream error:', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to stream archive file' });
+    }
+  }
 }
 
 // ── Log DOJ removal ───────────────────────────────────────────────────────────
@@ -317,23 +311,23 @@ router.get(
         logRemoval(`EFTA${eftaPadded}`, ds.num);
       }
 
-      // Generate a pre-signed URL — expires in 1 hour, no direct S3 exposure
-      let signedUrl;
-      try {
-        signedUrl = getPresignedUrl(ds, eftaPadded);
-      } catch (err) {
-        console.error('[resolve] Pre-sign error:', err.message);
-        return res.status(500).json({ error: 'Could not generate archive URL' });
+      // Check if client wants JSON metadata or the actual file
+      const wantsJson = req.headers['accept']?.includes('application/json') ||
+                        req.query.meta === '1';
+
+      if (wantsJson) {
+        // Return metadata only — used by dashboard/API consumers
+        return res.json({
+          efta:             `EFTA${eftaPadded}`,
+          dataset:          ds.num,
+          source:           'archive',
+          removed_from_doj: onDOJ === false,
+          stream_url:       `/api/resolve/${req.params.efta}`,
+        });
       }
 
-      return res.json({
-        efta:             `EFTA${eftaPadded}`,
-        dataset:          ds.num,
-        source:           'archive',
-        url:              signedUrl,
-        url_expires_in:   SIGNED_URL_EXPIRY_SECONDS,
-        removed_from_doj: onDOJ === false,
-      });
+      // Stream the file directly — browser opens PDF without exposing S3 URL
+      return streamFromArchive(ds, eftaPadded, res);
     }
 
     // ── Step 3: DOJ inconclusive — return DOJ URL as best guess ─────────────
