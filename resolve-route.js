@@ -225,21 +225,11 @@ async function streamFromArchive(ds, eftaPadded, res) {
     }
     res.setHeader('Cache-Control', 'private, max-age=3600');
 
-    // AWS SDK v3 returns a web ReadableStream, not a Node.js stream.
-    // Convert it to a Node.js readable stream before piping.
-    const { Readable } = require('stream');
-    const nodeStream = Readable.fromWeb
-      ? Readable.fromWeb(s3Res.Body)           // Node 18+
-      : require('stream').Readable.from(s3Res.Body);
-
-    nodeStream.pipe(res);
-
-    nodeStream.on('error', (err) => {
-      console.error('[resolve] Stream pipe error:', err.message);
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Stream interrupted' });
-      }
-    });
+    // AWS SDK v3 Body is a SdkStreamMixin — use transformToByteArray to
+    // collect the full buffer, then send it. For large PDFs this is fine
+    // since most Epstein files are under 5MB.
+    const bytes = await s3Res.Body.transformToByteArray();
+    res.end(Buffer.from(bytes));
 
   } catch (err) {
     console.error('[resolve] Stream error:', err.message);
