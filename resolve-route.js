@@ -223,11 +223,24 @@ async function streamFromArchive(ds, eftaPadded, res) {
     if (s3Res.ContentLength) {
       res.setHeader('Content-Length', s3Res.ContentLength);
     }
-    // Cache for 1 hour in browser
     res.setHeader('Cache-Control', 'private, max-age=3600');
 
-    // Stream S3 body to response
-    s3Res.Body.pipe(res);
+    // AWS SDK v3 returns a web ReadableStream, not a Node.js stream.
+    // Convert it to a Node.js readable stream before piping.
+    const { Readable } = require('stream');
+    const nodeStream = Readable.fromWeb
+      ? Readable.fromWeb(s3Res.Body)           // Node 18+
+      : require('stream').Readable.from(s3Res.Body);
+
+    nodeStream.pipe(res);
+
+    nodeStream.on('error', (err) => {
+      console.error('[resolve] Stream pipe error:', err.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Stream interrupted' });
+      }
+    });
+
   } catch (err) {
     console.error('[resolve] Stream error:', err.message);
     if (!res.headersSent) {
@@ -243,10 +256,10 @@ async function logRemoval(efta, datasetNum) {
     await ensureTable();
     await db.query(
       `INSERT INTO doj_removals (efta, dataset, served_from)
-       SELECT $1, $2, 'archive'
+       SELECT $1::varchar, $2::integer, 'archive'
        WHERE NOT EXISTS (
          SELECT 1 FROM doj_removals
-         WHERE efta = $1
+         WHERE efta = $1::varchar
          AND detected_at > NOW() - INTERVAL '24 hours'
        )`,
       [efta, datasetNum]
