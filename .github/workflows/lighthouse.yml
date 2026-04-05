@@ -1,0 +1,48 @@
+name: Lighthouse DocketZero
+
+on:
+  workflow_dispatch:
+
+jobs:
+  lighthouse:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Run Lighthouse (mobile)
+        env:
+          LHCI_CHROMIUM_PATH: /usr/bin/google-chrome
+        run: |
+          npx @lhci/cli@0.13.0 autorun \
+            --collect.url=https://docketzero.com \
+            --collect.numberOfRuns=1 \
+            --collect.settings.formFactor=mobile \
+            --collect.settings.screenEmulation.mobile=true \
+            --collect.settings.skipAudits=uses-http2 \
+            --upload.target=filesystem \
+            --upload.outputDir=./lighthouse-report/mobile
+
+      - name: Run Lighthouse (desktop)
+        env:
+          LHCI_CHROMIUM_PATH: /usr/bin/google-chrome
+        run: |
+          npx @lhci/cli@0.13.0 autorun \
+            --collect.url=https://docketzero.com \
+            --collect.numberOfRuns=1 \
+            --collect.settings.formFactor=desktop \
+            --collect.settings.screenEmulation.disabled=true \
+            --collect.settings.skipAudits=uses-http2 \
+            --upload.target=filesystem \
+            --upload.outputDir=./lighthouse-report/desktop
+
+      - name: Upload Lighthouse artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-docketzero
+          path: lighthouse-report
