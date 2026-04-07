@@ -100,11 +100,29 @@ const ALLOWED_ORIGINS = [
   'http://127.0.0.1:5500',
 ];
 
+function isAllowedOrigin(origin) {
+  return !origin || ALLOWED_ORIGINS.includes(origin);
+}
+
+app.use((req, res, next) => {
+  const origin = req.get('Origin');
+
+  if (isAllowedOrigin(origin)) {
+    return next();
+  }
+
+  // Return a clean policy denial instead of sending blocked CORS requests
+  // through the generic 500 error handler.
+  if (req.method === 'OPTIONS') {
+    return res.status(403).json({ error: 'Origin not allowed by CORS policy.' });
+  }
+
+  return res.status(403).json({ error: 'Origin not allowed by CORS policy.' });
+});
+
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin) return callback(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    callback(new Error(`CORS blocked: ${origin}`));
+    callback(null, isAllowedOrigin(origin));
   },
   credentials: true,
 }));
