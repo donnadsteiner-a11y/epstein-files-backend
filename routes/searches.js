@@ -20,6 +20,11 @@ const express         = require('express');
 const router          = express.Router();
 const pool            = require('../db/pool');
 const { requireAuth } = require('../middleware/auth');
+const {
+  buildUsageSnapshot,
+  getUserAccessProfile,
+  isUnlimited,
+} = require('../lib/access');
 
 // Valid investigation slugs — extend as new investigations are added
 const VALID_INVESTIGATIONS = ['epstein'];
@@ -103,14 +108,24 @@ router.post('/me/saved-searches', requireAuth, async (req, res) => {
   const inv = VALID_INVESTIGATIONS.includes(investigation) ? investigation : 'epstein';
 
   try {
-    // Cap at 50 saved searches per user
+    const access = await getUserAccessProfile(req.user.id);
+    if (!access) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    if (!access.entitlements.can_save_searches) {
+      return res.status(403).json({ error: 'Your account cannot save searches.' });
+    }
+
     const countRes = await pool.query(
       'SELECT COUNT(*) FROM saved_searches WHERE user_id = $1',
       [req.user.id]
     );
-    if (parseInt(countRes.rows[0].count) >= 50) {
+    const savedSearchCount = parseInt(countRes.rows[0].count, 10);
+
+    if (!isUnlimited(access.entitlements.saved_search_limit) && savedSearchCount >= access.entitlements.saved_search_limit) {
       return res.status(400).json({
-        error: 'Maximum 50 saved searches reached. Please delete some to save new ones.',
+        error: `${access.entitlements.label} includes up to ${access.entitlements.saved_search_limit} saved searches. Delete one before saving another.`,
       });
     }
 
@@ -130,7 +145,12 @@ router.post('/me/saved-searches', requireAuth, async (req, res) => {
         inv,
       ]
     );
-    res.status(201).json(result.rows[0]);
+    res.status(201).json({
+      ...result.rows[0],
+      usage: buildUsageSnapshot(access.entitlements, {
+        saved_searches: savedSearchCount + 1,
+      }),
+    });
   } catch (err) {
     console.error('[searches] POST error:', err.message);
     res.status(500).json({ error: 'Failed to save search' });
