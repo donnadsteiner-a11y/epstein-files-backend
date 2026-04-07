@@ -10,6 +10,7 @@ const pool       = require('./db/pool');
 
 const authRouter     = require('./routes/auth');
 const contactRouter  = require('./routes/contact');
+const reportsRouter  = require('./routes/reports');
 const statsRouter    = require('./routes/stats');
 const searchesRouter = require('./routes/searches');
 const resolveRoute   = require('./resolve-route');
@@ -27,6 +28,7 @@ async function runMigrations() {
         password_hash        VARCHAR(255) NOT NULL,
         first_name           VARCHAR(100) NOT NULL,
         last_name            VARCHAR(100) NOT NULL,
+        plan_tier            VARCHAR(20) NOT NULL DEFAULT 'tier_1',
         role                 VARCHAR(100),
         interest             VARCHAR(200),
         referral_source      VARCHAR(200),
@@ -70,10 +72,34 @@ async function runMigrations() {
         filters      JSONB DEFAULT '{}',
         result_count INTEGER DEFAULT 0,
         pinned       BOOLEAN NOT NULL DEFAULT FALSE,
+        investigation VARCHAR(50) NOT NULL DEFAULT 'epstein',
         created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_saved_searches_user_id ON saved_searches(user_id);
+
+      CREATE TABLE IF NOT EXISTS saved_reports (
+        id            SERIAL PRIMARY KEY,
+        user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title         VARCHAR(200) NOT NULL,
+        summary       TEXT,
+        investigation VARCHAR(50) NOT NULL DEFAULT 'epstein',
+        report_type   VARCHAR(50) NOT NULL DEFAULT 'search_snapshot',
+        query         TEXT,
+        dataset       VARCHAR(50),
+        filters       JSONB DEFAULT '{}',
+        result_count  INTEGER DEFAULT 0,
+        snapshot      JSONB DEFAULT '{}',
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_saved_reports_user_id ON saved_reports(user_id);
+
+      ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS plan_tier VARCHAR(20) NOT NULL DEFAULT 'tier_1';
+
+      ALTER TABLE saved_searches
+        ADD COLUMN IF NOT EXISTS investigation VARCHAR(50) NOT NULL DEFAULT 'epstein';
     `);
     console.log('[DB] Tables ready');
   } catch (err) {
@@ -153,6 +179,7 @@ app.use('/api/auth',    authRouter);
 app.use('/api/contact', contactRouter);
 app.use('/api/stats',   statsRouter);
 app.use('/api/users',   searchesRouter);
+app.use('/api/users',   reportsRouter);
 app.use('/api',         resolveRoute);   // catch-all — must be last
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
