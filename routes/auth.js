@@ -13,6 +13,7 @@ const nodemailer = require('nodemailer');
 const rateLimit  = require('express-rate-limit');
 const pool       = require('../db/pool');
 const { requireAuth } = require('../middleware/auth');
+const { getPlanEntitlements } = require('../lib/access');
 
 const router = express.Router();
 
@@ -44,11 +45,14 @@ function generateAccessToken(user) {
 }
 
 function safeUser(row) {
+  const membership = getPlanEntitlements(row.plan_tier);
   return {
     id:                  row.id,
     email:               row.email,
     first_name:          row.first_name,
     last_name:           row.last_name,
+    plan_tier:           membership.plan_tier,
+    membership,
     role:                row.role,
     interest:            row.interest,
     referral_source:     row.referral_source,
